@@ -1,0 +1,44 @@
+
+============================================================
+Starting Training for 20 Epochs
+============================================================
+Epoch complete.
+Epoch 1/20 | Time: 6.1s | Eval Reward: 1.00
+Epoch complete.
+Epoch 2/20 | Time: 5.8s | Eval Reward: 1.00
+Epoch complete.
+Epoch 3/20 | Time: 6.2s | Eval Reward: 1.00
+Epoch complete.
+Epoch 4/20 | Time: 6.5s | Eval Reward: 1.00
+Epoch complete.
+Epoch 5/20 | Time: 6.4s | Eval Reward: 1.00
+Epoch complete.
+Epoch 6/20 | Time: 6.0s | Eval Reward: 1.00
+Epoch complete.
+Epoch 7/20 | Time: 6.2s | Eval Reward: 1.00
+Epoch complete.
+Epoch 8/20 | Time: 6.3s | Eval Reward: 1.00
+Epoch complete.
+Epoch 9/20 | Time: 5.5s | Eval Reward: 1.00
+Epoch complete.
+Epoch 10/20 | Time: 6.2s | Eval Reward: 1.00
+Epoch complete.
+Epoch 11/20 | Time: 5.4s | Eval Reward: 1.00
+Epoch complete.
+Epoch 12/20 | Time: 6.7s | Eval Reward: 1.00
+Epoch complete.
+Epoch 13/20 | Time: 6.7s | Eval Reward: 1.00
+Epoch complete.
+Epoch 14/20 | Time: 6.4s | Eval Reward: 1.00
+Epoch complete.
+Epoch 15/20 | Time: 6.7s | Eval Reward: 1.00
+Epoch complete.
+Epoch 16/20 | Time: 6.7s | Eval Reward: 1.00
+Epoch complete.
+Epoch 17/20 | Time: 6.5s | Eval Reward: 1.00
+Epoch complete.
+Epoch 18/20 | Time: 6.2s | Eval Reward: 1.00
+Epoch complete.
+Epoch 19/20 | Time: 5.9s | Eval Reward: 1.00
+Epoch complete.
+Epoch 20/20 | Time: 6.1s | Eval Reward: 1.00
