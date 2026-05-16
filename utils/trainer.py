@@ -7,7 +7,6 @@ class RLTrainer:
         self.env = make(self.cfg.env.name, **self.cfg.env.env_args)
 
     def train_one_epoch(self, **kwargs):
-        # 1. Run episodes to collect data
         # 2. Compute loss
         # 3. optimize step
         print(f"Epoch complete.")

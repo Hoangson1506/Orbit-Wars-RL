@@ -1,5 +1,12 @@
 env:
   name: "orbit_wars"
+  board_size: 100.0
+  episode_steps: 500
+  candidate_count: 8
+  ship_bucket_count: 8
+  max_planets: 48
+  max_ships: 400.0
+  max_production: float = 5.0
   env_args:
     configuration: {"seed": 42}
     debug: True
