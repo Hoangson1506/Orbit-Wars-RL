@@ -5,15 +5,20 @@ import sys
 import torch
 import random
 import numpy as np
-from torch.cuda.amp import GradScaler
 from omegaconf import OmegaConf
+from tqdm import tqdm
+
+from torchrl.data.replay_buffers import ReplayBuffer
+from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
+from torchrl.data.replay_buffers.storages import LazyTensorStorage
 
 from utils.logger import Logger
 from utils.registry import build_model, build_loss
-from utils.trainer import RLTrainer
 
 # MODELS AND LOSSES
-from agents import NearestPlanetAgent
+from agents.base import NearestPlanetAgent
+from algo_builder import build_ppo_agent
+from enviroment.processor import PaddedObservationProcessor, FixedActionProcessor
 
 if __name__ == "__main__":
     #-----------------------------------------------------------------------------#
@@ -51,60 +56,113 @@ if __name__ == "__main__":
 
 
     #-----------------------------------------------------------------------------#
-    # Agent                                                                       #
+    # Agent and Environment Setup                                                 #
     #-----------------------------------------------------------------------------#
-    agent = build_model(config)
+    env, actor, critic, collector, loss_module, adv_module, group = build_ppo_agent(config, PaddedObservationProcessor(), FixedActionProcessor())
+    optimizer = torch.optim.Adam(loss_module.parameters(), lr=config.training.lr)
 
-    if config.training.grad_checkpointing:
-        agent.set_grad_checkpointing(True)
+    # if config.training.grad_checkpointing:
+    #     agent.set_grad_checkpointing(True)
     
-    if config.training.checkpoint_start is not None:
-        print("Start from:", config.training.checkpoint_start)
-        ckpt = torch.load(config.training.checkpoint_start, map_location="cpu")
-        state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
-        agent.load_state_dict(state_dict, strict=False)
-
-    agent = agent.to(config.training.device)
-
-    #-----------------------------------------------------------------------------#
-    # Trainer Setup & Execution                                                   #
-    #-----------------------------------------------------------------------------#
-    trainer = RLTrainer(config, agent)
-    scaler = GradScaler(enabled=config.training.get("use_amp", False))
+    # if config.training.checkpoint_start is not None:
+    #     print("Start from:", config.training.checkpoint_start)
+    #     ckpt = torch.load(config.training.checkpoint_start, map_location="cpu")
+    #     state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+    #     agent.load_state_dict(state_dict, strict=False)
 
     best_reward = -float("inf")
     epochs = config.training.epochs
+    iters = config.collector.iters
+    frames_per_batch = config.collector.frames_per_batch
+    replay_buffer = ReplayBuffer(
+    storage=LazyTensorStorage(
+            frames_per_batch, device=config.training.device
+        ),  # We store the frames_per_batch collected at each iteration
+        sampler=SamplerWithoutReplacement(),
+        batch_size=config.training.batch_size,  # We will sample minibatches of this size
+    )
+    pbar = tqdm(total=iters*frames_per_batch, desc="Total Frames")
 
     print("\n" + "="*60)
     print(f"Starting Training for {epochs} Epochs")
     print("="*60)
 
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
+    for i, tensordict_data in enumerate(collector):
+        tensordict_data = tensordict_data.to(config.training.device)
+
+        with torch.no_grad():
+            adv_module(tensordict_data)
+
+        data_view = tensordict_data.reshape(-1)  
+        replay_buffer.extend(data_view)
+
+        total_loss_this_batch = 0.0
         
-        # 1. Collect Experience & Update Weights (The RL equivalent of train_one_epoch)
-        train_stats = trainer.train_one_epoch(scaler=scaler)
-        
-        # 2. Evaluate against baselines (e.g., 'random', previous versions)
-        if epoch % config.eval.eval_every_n_epoch == 0:
-            eval_reward = trainer.evaluate(num_episodes=config.eval.eval_episodes)
+        num_minibatches = max(1, len(data_view) // config.training.batch_size)
+
+        # 4. Loop over PPO Epochs
+        for epoch in range(config.training.epochs):
             
-            # 3. Logging & Checkpointing
-            epoch_time = time.time() - start_time
-            print(f"Epoch {epoch}/{epochs} | Time: {epoch_time:.1f}s | "
-                  f"Eval Reward: {eval_reward:.2f}")
+            # 5. Loop over minibatches using the ReplayBuffer
+            for _ in range(num_minibatches):
+                minibatch = replay_buffer.sample()
+                
+                # Compute loss values
+                loss_vals = loss_module(minibatch)
+                
+                loss_value = (
+                    loss_vals["loss_objective"] + 
+                    loss_vals["loss_critic"] + 
+                    loss_vals["loss_entropy"]
+                )
+                
+                # 6. Back propagate
+                loss_value.backward()
+                torch.nn.utils.clip_grad_norm_(loss_module.parameters(), config.training.max_grad_norm)
+                
+                # 7. Optimise
+                optimizer.step()
+                optimizer.zero_grad()
+                
+                total_loss_this_batch += loss_value.item()
 
-            # # Save latest checkpoint
-            # checkpoint_state = {
-            #     "epoch": epoch,
-            #     "state_dict": agent.state_dict(),
-            #     "optimizer": trainer.optimizer.state_dict(),
-            #     "eval_reward": eval_reward
-            # }
-            # torch.save(checkpoint_state, os.path.join(model_path, "latest_ckpt.pth"))
+        # ==========================================
+        # Logging & Metrics
+        # ==========================================
+        avg_reward = 0.0
+        next_td = tensordict_data.get("next")
+        if next_td is not None and (group, "episode_reward") in next_td.keys():
+            dones = next_td.get((group, "done"))
+            
+            if dones.any():
+                ep_rewards = next_td.get((group, "episode_reward"))[dones]
+                avg_reward = ep_rewards.mean().item()
+                pbar.set_postfix({"Avg Return": f"{avg_reward:.2f}", "Loss": f"{total_loss_this_batch:.2f}"})
+        
+        pbar.update(tensordict_data.numel())
+        
+        # ==========================================
+        # Checkpointing Logic
+        # ==========================================
+        # Save best checkpoint (based on the highest training batch reward)
+        if avg_reward > best_reward and dones.any():
+            best_reward = avg_reward
+            torch.save(checkpoint_state, os.path.join(model_path, f"iter_{i}_r_{avg_reward:.3f}.pth"))
+            print("\n -> New Best Model Saved! (Reward: {:.2f})".format(best_reward))
+            
+        # Save latest checkpoint
+        checkpoint_state = {
+            "iteration": i,
+            "actor_state_dict": actor.state_dict(),
+            "critic_state_dict": critic.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "eval_reward": avg_reward
+        }
+        torch.save(checkpoint_state, os.path.join(model_path, "latest_ckpt.pth"))
 
-            # # Save best checkpoint
-            # if eval_reward > best_reward:
-            #     best_reward = eval_reward
-            #     torch.save(checkpoint_state, os.path.join(model_path, "best_ckpt.pth"))
-            #     print(f" -> New Best Model Saved! (Reward: {best_reward:.2f})")
+    pbar.close()
+    
+    print("\nTraining Complete! Saving final models...")
+    torch.save(actor.state_dict(), os.path.join(model_path, "orbit_wars_actor_final.pt"))
+    torch.save(critic.state_dict(), os.path.join(model_path, "orbit_wars_critic_final.pt"))
+    print("Models saved successfully.")

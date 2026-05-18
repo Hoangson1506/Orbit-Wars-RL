@@ -145,6 +145,11 @@ def encode_turn(obs: Any, env_cfg, *, env_index: int = 0) -> TurnBatch:
     """Convert raw observation into a structured TurnBatch for the agent."""
     state = obs if isinstance(obs, GameState) else parse_observation(obs)
 
+    # print(f"DEBUG: Total planets found: {len(state.planets)}")
+    # print(f"DEBUG: Viewing as player ID: {state.player} (Type: {type(state.player)})")
+    # if state.planets:
+    #     print(f"DEBUG: Planet 0 owner is: {state.planets[0].owner} (Type: {type(state.planets[0].owner)})")
+
     my_planets = sorted((planet for planet in state.planets if planet.owner == state.player), key=lambda planet: planet.id)
     if not my_planets:
         return TurnBatch(

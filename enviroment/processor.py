@@ -37,9 +37,9 @@ class BaseActionProcessor(ABC):
 class PaddedObservationProcessor(BaseObservationProcessor):
     def get_space(self, env_cfg) -> gym.Space:
         return gym.spaces.Dict({
-            "global": gym.spaces.Box(low=-1, high=1000, shape=(global_feature_dim(),), dtype=np.float32),
-            "self": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, self_feature_dim()), dtype=np.float32),
-            "candidates": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32),
+            "global_features": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, global_feature_dim(),), dtype=np.float32),
+            "self_features": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, self_feature_dim()), dtype=np.float32),
+            "candidates_features": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32),
             "mask": gym.spaces.Box(low=0, high=1, shape=(env_cfg.max_planets, env_cfg.candidate_count), dtype=np.int8)
         })
 
@@ -48,15 +48,16 @@ class PaddedObservationProcessor(BaseObservationProcessor):
         pad_self = np.zeros((env_cfg.max_planets, self_feature_dim()), dtype=np.float32)
         pad_cand = np.zeros((env_cfg.max_planets, env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32)
         pad_mask = np.zeros((env_cfg.max_planets, env_cfg.candidate_count), dtype=np.int8)
-        pad_global = batch.global_features[0] if N > 0 else np.zeros(global_feature_dim(), dtype=np.float32)
+        pad_global = np.zeros((env_cfg.max_planets, global_feature_dim()), dtype=np.float32)
 
         if N > 0:
             limit = min(N, env_cfg.max_planets)
             pad_self[:limit] = batch.self_features[:limit]
             pad_cand[:limit] = batch.candidate_features[:limit]
             pad_mask[:limit] = batch.candidate_mask[:limit].astype(np.int8)
+            pad_global[:limit] = batch.global_features[:limit]
 
-        return {"global": pad_global, "self": pad_self, "candidates": pad_cand, "mask": pad_mask}
+        return {"global_features": pad_global, "self_features": pad_self, "candidates_features": pad_cand, "mask": pad_mask}
 
 
 class FixedActionProcessor(BaseActionProcessor):
@@ -79,7 +80,7 @@ class TransformerObservationProcessor(BaseObservationProcessor):
     def get_space(self, env_cfg) -> gym.Space:
         # Sequence processing requires varying sizes or sequential Dict spaces 
         return gym.spaces.Dict({
-            "global_context": gym.spaces.Box(low=-1, high=1000, shape=(global_feature_dim(),), dtype=np.float32),
+            "global_features": gym.spaces.Box(low=-1, high=1000, shape=(global_feature_dim(),), dtype=np.float32),
             "sequence_data": gym.spaces.Box(low=-1, high=1000, shape=(env_cfg.max_planets, self_feature_dim() + (env_cfg.candidate_count * candidate_feature_dim())), dtype=np.float32)
         })
 

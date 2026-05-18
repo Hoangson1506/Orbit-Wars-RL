@@ -1,5 +1,5 @@
 from kaggle_environments import make
-from agents import NearestPlanetAgent
+from agents.base import NearestPlanetAgent
 
 env = make("orbit_wars", configuration={"seed": 42}, debug=False)
 agent = NearestPlanetAgent()

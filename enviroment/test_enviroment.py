@@ -1,95 +1,102 @@
-import numpy as np
-import gymnasium as gym
-from dataclasses import dataclass
+import pprint
+from pettingzoo.test import parallel_api_test
 
-from enviroment.processor import (
-    PaddedObservationProcessor, 
-    FixedActionProcessor
-)
+# Import your environment and dependencies here
+# from your_module import OrbitWarsMARLWrapper, Config, ObsProcessor, ActProcessor
 from enviroment.orbit_wars import OrbitWarsWrapper
+from enviroment.processor import PaddedObservationProcessor, FixedActionProcessor
 
-@dataclass
-class EnvConfig:
-    board_size: float = 100.0
-    episode_steps: int = 1000
-    candidate_count: int = 9
-    ship_bucket_count: int = 8
-    max_planets: int = 50
-    max_ships: float = 400.0
-    max_production: float = 5.0
+class Config:
+    def __init__(self):
+        self.env = self.EnvConfig()
 
+    class EnvConfig:
+        def __init__(self):
+            self.max_planets = 10
+            self.candidate_count = 5
+            self.board_size = 100.0
+            self.episode_steps = 500
+            self.candidate_count = 8
+            self.ship_bucket_count = 8
+            self.max_planets = 48
+            self.max_ships = 400.0
+            self.max_production = 5.0
 
-def test_environment():
-    print("="*50)
-    print("Initializing Orbit Wars Environment Test")
-    print("="*50)
-
-    # 1. Setup Configuration
-    # We use a smaller candidate count for testing to keep logs clean
-    config = EnvConfig()
-
-    # 2. Instantiate Strategies and Wrapper
+def test_orbit_wars_env():
+    print("=== Setting up the Environment ===")
+    # 1. Initialize your specific config and processors (Replace with your actual classes)
+    config = Config()
     obs_processor = PaddedObservationProcessor()
     act_processor = FixedActionProcessor()
     
-    env = OrbitWarsWrapper(
-        env_cfg=config,
-        obs_processor=obs_processor,
-        act_processor=act_processor
-    )
-
-    # 3. Test Reset and Observation Space
-    print("\n[TEST 1] Resetting Environment...")
-    obs, info = env.reset()
+    env = OrbitWarsWrapper(config, obs_processor, act_processor)
     
-    print("Observation Dictionary Shapes:")
-    for key, value in obs.items():
-        print(f"  - {key}: {value.shape} (dtype: {value.dtype})")
+    # --- For the sake of this script, assuming 'env' is instantiated ---
+    
+    print("\n=== Running PettingZoo API Test ===")
+    # This will throw an error if your env breaks any standard PettingZoo rules
+    try:
+        parallel_api_test(env, num_cycles=100)
+        print("API Test Passed! Your environment is perfectly compliant.")
+    except Exception as e:
+        print(f"API Test Failed. See error: {e}")
+        return
 
-    # Validate against expected shapes
-    assert obs["global"].shape == (8,), "Global shape mismatch!"
-    assert obs["self"].shape == (50, 11), "Self shape mismatch!"
-    assert obs["candidates"].shape == (50, 9, 14), "Candidates shape mismatch!"
-    assert obs["mask"].shape == (50, 9), "Mask shape mismatch!"
-    print("✅ Observation shapes passed!")
+    print("\n=== Starting Step-by-Step Execution ===")
+    
+    # 2. Reset the environment
+    obs, infos = env.reset()
+    
+    print("\n--- STEP 0 (Reset) ---")
+    print(f"Active Agents: {env.agents}")
+    print("Initial Observations:")
+    pprint.pprint(obs, depth=2) # depth=2 keeps giant arrays from flooding the console
+    print("Initial Infos:")
+    pprint.pprint(infos)
 
-    # 4. Test Action Space
-    print(f"\n[TEST 2] Action Space:")
-    print(f"  - Type: {type(env.action_space)}")
-    print(f"  - Shape: {env.action_space.shape}")
-    print("✅ Action space verified!")
-
-    # 5. Run a Dummy Episode
-    print("\n[TEST 3] Running Random Agent Episode...")
-    total_reward = 0
-    steps = 0
-    done = False
-
-    while not done:
-        # Sample a random action from our MultiDiscrete space
-        # Note: In a real scenario, you would mask this using obs["mask"]!
-        random_action = env.action_space.sample()
+    # 3. Run a test loop for a fixed number of steps
+    max_steps = 0
+    step_count = 0
+    
+    # Run while there are still active agents and we haven't hit our step limit
+    while env.agents and step_count < max_steps:
+        step_count += 1
+        print(f"\n--- STEP {step_count} ---")
         
-        # Step the environment
-        obs, reward, done, truncated, info = env.step(random_action)
-        
-        total_reward += reward
-        steps += 1
-        
-        if steps % 50 == 0:
-            print(f"  Step {steps}... Current Total Reward: {total_reward}")
+        # 4. Sample random actions for all currently active agents
+        actions = {}
+        for agent in env.agents:
+            # Assumes your act_processor.get_space() returned a valid gymnasium Space
+            actions[agent] = env.action_space(agent).sample() 
             
-        # Hard stop just in case
-        if steps > config.episode_steps + 10:
-            print("❌ Episode exceeded maximum steps!")
-            break
-
-    print("\n" + "="*50)
-    print(f"Episode Finished!")
-    print(f"Total Steps Taken: {steps}")
-    print(f"Total Reward: {total_reward}")
-    print("="*50)
-    print("✅ Environment is fully operational and ready for RLlib/TorchRL!")
+        print("Sampled Actions:")
+        pprint.pprint(actions)
+        
+        # 5. Step the environment
+        obs, rewards, terminations, truncations, infos = env.step(actions)
+        pprint.pprint("Observations:")
+        pprint.pprint(obs, depth=2)
+        
+        # 6. Print the results of the step
+        print("\nRewards:")
+        pprint.pprint(rewards)
+        
+        print("\nTerminations (Done):")
+        pprint.pprint(terminations)
+        
+        print("\nTruncations (Timeouts/Errors):")
+        pprint.pprint(truncations)
+        
+        print("\nInfos (Status):")
+        pprint.pprint(infos)
+        
+        # Optional: Print observation keys or shapes to avoid console spam
+        print("\nObservation Keys:")
+        for agent, agent_obs in obs.items():
+            print(f"  {agent}: {list(agent_obs.keys()) if isinstance(agent_obs, dict) else 'Array shape: ' + str(getattr(agent_obs, 'shape', 'Unknown'))}")
+            
+    print(f"\n=== Test Finished after {step_count} steps ===")
 
 if __name__ == "__main__":
-    test_environment()
+    # Uncomment and run once you have your 'env' instantiated inside the function
+    test_orbit_wars_env()
