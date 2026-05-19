@@ -44,5 +44,4 @@ class NearestPlanetAgent(BaseAgent):
             if mine.ships >= ships_needed:
                 angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
                 moves.append([mine.id, angle, ships_needed])
-
         return moves

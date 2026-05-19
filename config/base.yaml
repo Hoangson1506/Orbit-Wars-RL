@@ -19,8 +19,8 @@ algorithm:
   name: "PPO"
 
 collector:
-  frames_per_batch: 6000
-  iters: 10
+  frames_per_batch: 2000
+  iters: 100
 
 model:
   model_path: "./orbit_wars_checkpoint"
@@ -39,7 +39,7 @@ loss:
     gamma: 0.99
     gae_lambda: 0.9
     clip_epsilon: 0.2
-    entropy_coeff: 1e-4
+    entropy_coeff: 5e-4
 
 eval:
   # Eval
@@ -53,7 +53,7 @@ training:
   mixed_precision: False
   custom_sampling: True        
   seed: 1
-  epochs: 10
+  epochs: 5
   batch_size: 200              
   verbose: True
   gpu_ids: [0,]           # GPU ids for training
@@ -62,7 +62,7 @@ training:
   sim_sample: False
 
   # Optimizer 
-  max_grad_norm: 10.0                     # None | float
+  max_grad_norm: 100.0                     # None | float
   decay_exclude_bias: False
   grad_checkpointing: False     # Gradient Checkpointing
   
@@ -90,3 +90,5 @@ training:
   
   # make cudnn deterministic
   cudnn_deterministic: False
+
+  opp_update_freq: 1        

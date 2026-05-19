@@ -16,7 +16,9 @@ from utils.logger import Logger
 from utils.registry import build_model, build_loss
 
 # MODELS AND LOSSES
-from agents.base import NearestPlanetAgent
+from agent.base import NearestPlanetAgent
+from agent.actor_critic import Actor
+from agent.opponent import FrozenPPOOpponent, NearestNeighborOpponent
 from algo_builder import build_ppo_agent
 from enviroment.processor import PaddedObservationProcessor, FixedActionProcessor
 
@@ -58,7 +60,17 @@ if __name__ == "__main__":
     #-----------------------------------------------------------------------------#
     # Agent and Environment Setup                                                 #
     #-----------------------------------------------------------------------------#
-    env, actor, critic, collector, loss_module, adv_module, group = build_ppo_agent(config, PaddedObservationProcessor(), FixedActionProcessor())
+    # frozen_actor = Actor(
+    #     config.model.model_args.candidate_count,
+    #     config.model.model_args.self_feature_dim,
+    #     config.model.model_args.candidate_feature_dim,
+    #     config.model.model_args.global_feature_dim,
+    #     config.model.model_args.hidden_dim
+    # ).to(config.training.device)
+    # opponent = FrozenPPOOpponent(frozen_actor, config, PaddedObservationProcessor(), FixedActionProcessor())
+    opponent = NearestNeighborOpponent()
+
+    env, actor, critic, collector, loss_module, adv_module = build_ppo_agent(config, opponent, PaddedObservationProcessor(), FixedActionProcessor())
     optimizer = torch.optim.Adam(loss_module.parameters(), lr=config.training.lr)
 
     # if config.training.grad_checkpointing:
@@ -126,18 +138,44 @@ if __name__ == "__main__":
                 
                 total_loss_this_batch += loss_value.item()
 
+        if i % config.training.opp_update_freq == 0:
+            print("Curriculum Level Up: Syncing Opponent Weights!")
+            opponent.sync_from(actor.module[0])
+
         # ==========================================
         # Logging & Metrics
         # ==========================================
         avg_reward = 0.0
         next_td = tensordict_data.get("next")
-        if next_td is not None and (group, "episode_reward") in next_td.keys():
-            dones = next_td.get((group, "done"))
+        # if next_td is not None and (group, "episode_reward") in next_td.keys(include_nested=True):
+        #     dones = next_td.get((group, "done"))
+        #     game_over_mask = dones.squeeze(-1).any(dim=1)
+            
+        #     if dones.any():
+        #         ep_rewards = next_td.get((group, "episode_reward"))[dones]
+        #         ep_lengths = next_td.get("step_count")[game_over_mask]
+        #         avg_len = ep_lengths.float().mean().item()
+        #         avg_reward = ep_rewards.mean().item()
+        #         pbar.set_postfix({"Avg Return": f"{avg_reward:.2f}", "Loss": f"{total_loss_this_batch:.2f}, Len: {avg_len:.2f}"})
+        
+        # pbar.update(tensordict_data.numel())
+
+        if next_td is not None and "episode_reward" in next_td.keys():
+            dones = next_td.get("done") 
             
             if dones.any():
-                ep_rewards = next_td.get((group, "episode_reward"))[dones]
+                # Directly mask the tensors using the boolean 'dones' tensor
+                ep_rewards = next_td.get("episode_reward")[dones]
+                ep_lengths = next_td.get("step_count")[dones]
+                
+                avg_len = ep_lengths.float().mean().item()
                 avg_reward = ep_rewards.mean().item()
-                pbar.set_postfix({"Avg Return": f"{avg_reward:.2f}", "Loss": f"{total_loss_this_batch:.2f}"})
+                
+                pbar.set_postfix({
+                    "Avg Return": f"{avg_reward:.4f}", 
+                    "Loss": f"{total_loss_this_batch:.2f}", 
+                    "Len": f"{avg_len:.2f}"
+                })
         
         pbar.update(tensordict_data.numel())
         
@@ -145,12 +183,6 @@ if __name__ == "__main__":
         # Checkpointing Logic
         # ==========================================
         # Save best checkpoint (based on the highest training batch reward)
-        if avg_reward > best_reward and dones.any():
-            best_reward = avg_reward
-            torch.save(checkpoint_state, os.path.join(model_path, f"iter_{i}_r_{avg_reward:.3f}.pth"))
-            print("\n -> New Best Model Saved! (Reward: {:.2f})".format(best_reward))
-            
-        # Save latest checkpoint
         checkpoint_state = {
             "iteration": i,
             "actor_state_dict": actor.state_dict(),
@@ -158,6 +190,12 @@ if __name__ == "__main__":
             "optimizer": optimizer.state_dict(),
             "eval_reward": avg_reward
         }
+        if avg_reward > best_reward and dones.any():
+            best_reward = avg_reward
+            torch.save(checkpoint_state, os.path.join(model_path, f"iter_{i}_r_{avg_reward:.3f}.pth"))
+            print("\n -> New Best Model Saved! (Reward: {:.2f})".format(best_reward))
+            
+        # Save latest checkpoint
         torch.save(checkpoint_state, os.path.join(model_path, "latest_ckpt.pth"))
 
     pbar.close()

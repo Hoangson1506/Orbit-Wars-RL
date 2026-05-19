@@ -13,7 +13,6 @@ class Config:
     class EnvConfig:
         def __init__(self):
             self.max_planets = 10
-            self.candidate_count = 5
             self.board_size = 100.0
             self.episode_steps = 500
             self.candidate_count = 8
@@ -55,7 +54,7 @@ def test_orbit_wars_env():
     pprint.pprint(infos)
 
     # 3. Run a test loop for a fixed number of steps
-    max_steps = 0
+    max_steps = 4
     step_count = 0
     
     # Run while there are still active agents and we haven't hit our step limit
