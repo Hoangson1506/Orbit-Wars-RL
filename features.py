@@ -1,39 +1,17 @@
+import math
 from dataclasses import dataclass
 from typing import Any
-import math
+
 import numpy as np
+
+from config import EnvConfig
+from game_types import GameState, PlanetState, parse_observation
 
 BOARD_CENTER = (50.0, 50.0)
 ROTATION_RADIUS_LIMIT = 50.0
 SUN_RADIUS = 10.0
 PLANET_LAUNCH_RADIUS_OFFSET = 0.1
 
-@dataclass(slots=True)
-class PlanetState:
-    id: int
-    owner: int
-    x: float
-    y: float
-    radius: float
-    ships: int
-    production: int
-
-@dataclass(slots=True)
-class FleetState:
-    id: int
-    owner: int
-    x: float
-    y: float
-    angle: float
-    from_planet_id: int
-    ships: int
-
-@dataclass(slots=True)
-class GameState:
-    step: int
-    player: int
-    planets: list[PlanetState]
-    fleets: list[FleetState]
 
 @dataclass(slots=True)
 class DecisionContext:
@@ -53,6 +31,7 @@ class TurnBatch:
     contexts: list[DecisionContext]
     state: GameState
 
+
 def self_feature_dim() -> int:
     return 11
 
@@ -64,92 +43,13 @@ def candidate_feature_dim() -> int:
 def global_feature_dim() -> int:
     return 8
 
-def fixed_ship_count(src: PlanetState, tgt: PlanetState) -> int:
-    return max(tgt.ships + 1, 20)
-
-
-def distance(a: PlanetState, b: PlanetState) -> float:
-    return math.hypot(a.x - b.x, a.y - b.y)
-
-
-def total_ships(planets: list[PlanetState]) -> float:
-    return float(sum(planet.ships for planet in planets))
-
-
-def is_rotating_planet(planet: PlanetState) -> bool:
-    dx = planet.x - BOARD_CENTER[0]
-    dy = planet.y - BOARD_CENTER[1]
-    orbital_radius = math.hypot(dx, dy)
-    return orbital_radius + planet.radius < ROTATION_RADIUS_LIMIT
-
-
-def shot_crosses_sun(src: PlanetState, angle: float, tgt: PlanetState) -> bool:
-    start_x = src.x + math.cos(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
-    start_y = src.y + math.sin(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
-    return point_to_segment_distance(BOARD_CENTER, (start_x, start_y), (tgt.x, tgt.y)) < SUN_RADIUS
-
-
-def point_to_segment_distance(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> float:
-    segment_len_sq = (start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2
-    if segment_len_sq == 0.0:
-        return math.hypot(point[0] - start[0], point[1] - start[1])
-    projection = (
-        ((point[0] - start[0]) * (end[0] - start[0]) + (point[1] - start[1]) * (end[1] - start[1]))
-        / segment_len_sq
-    )
-    projection = max(0.0, min(1.0, projection))
-    closest_x = start[0] + projection * (end[0] - start[0])
-    closest_y = start[1] + projection * (end[1] - start[1])
-    return math.hypot(point[0] - closest_x, point[1] - closest_y)
-
-
-def parse_observation(obs: Any) -> GameState:
-    def obs_get(key: str, default: Any):
-        if isinstance(obs, dict):
-            return obs.get(key, default)
-        return getattr(obs, key, default)
-    
-    planets = [
-        PlanetState(
-            id=int(row[0]),
-            owner=int(row[1]),
-            x=float(row[2]),
-            y=float(row[3]),
-            radius=float(row[4]),
-            ships=int(row[5]),
-            production=int(row[6])
-        ) for row in obs_get("planets", [])
-    ]
-
-    fleets = [
-        FleetState (
-            id=int(row[0]),
-            owner=int(row[1]),
-            x=float(row[2]),
-            y=float(row[3]),
-            angle=float(row[4]),
-            from_planet_id=int(row[5]),
-            ships=int(row[6]),
-        )
-        for row in obs_get("fleets", [])
-    ]
-
-    return GameState(
-        step=int(obs_get("step", 0)),
-        player=int(obs_get("player", 0)),
-        planets=planets,
-        fleets=fleets,
-    )
-
-def encode_turn(obs: Any, env_cfg, *, env_index: int = 0) -> TurnBatch:
-    """Convert raw observation into a structured TurnBatch for the agent."""
-    state = obs if isinstance(obs, GameState) else parse_observation(obs)
-
-    # print(f"DEBUG: Total planets found: {len(state.planets)}")
-    # print(f"DEBUG: Viewing as player ID: {state.player} (Type: {type(state.player)})")
-    # if state.planets:
-    #     print(f"DEBUG: Planet 0 owner is: {state.planets[0].owner} (Type: {type(state.planets[0].owner)})")
-
+def encode_turn(
+    observation: Any,
+    env_cfg: EnvConfig,
+    *,
+    env_index: int = 0,
+) -> TurnBatch:
+    state = observation if isinstance(observation, GameState) else parse_observation(observation)
     my_planets = sorted((planet for planet in state.planets if planet.owner == state.player), key=lambda planet: planet.id)
     if not my_planets:
         return TurnBatch(
@@ -160,12 +60,12 @@ def encode_turn(obs: Any, env_cfg, *, env_index: int = 0) -> TurnBatch:
             contexts=[],
             state=state,
         )
-    
+
     global_feat = build_global_features(state, env_cfg)
-    self_rows = []
-    candidate_rows = []
-    candidate_masks = []
-    contexts = []
+    self_rows: list[np.ndarray] = []
+    candidate_rows: list[np.ndarray] = []
+    candidate_masks: list[np.ndarray] = []
+    contexts: list[DecisionContext] = []
 
     for src in my_planets:
         candidates = build_candidates(src, state, env_cfg)
@@ -197,8 +97,8 @@ def encode_turn(obs: Any, env_cfg, *, env_index: int = 0) -> TurnBatch:
         contexts=contexts,
         state=state,
     )
-    
-def build_candidates(src: PlanetState, state: GameState, env_cfg) -> list[PlanetState]:
+
+def build_candidates(src: PlanetState, state: GameState, env_cfg: EnvConfig) -> list[PlanetState]:
     others = [planet for planet in state.planets if planet.id != src.id]
     enemy_quota = env_cfg.candidate_count // 3
     neutral_quota = env_cfg.candidate_count // 3
@@ -229,7 +129,7 @@ def build_candidates(src: PlanetState, state: GameState, env_cfg) -> list[Planet
     candidates.extend(fallback[: env_cfg.candidate_count - len(candidates)])
     return candidates
 
-def build_self_features(src: PlanetState, state: GameState, env_cfg) -> np.ndarray:
+def build_self_features(src: PlanetState, state: GameState, env_cfg: EnvConfig) -> np.ndarray:
     my_planets = [planet for planet in state.planets if planet.owner == state.player]
     enemy_planets = [planet for planet in state.planets if planet.owner not in {-1, state.player}]
     return np.asarray(
@@ -249,12 +149,11 @@ def build_self_features(src: PlanetState, state: GameState, env_cfg) -> np.ndarr
         dtype=np.float32,
     )
 
-
 def build_candidate_features(
     src: PlanetState,
     candidates: list[PlanetState],
     state: GameState,
-    env_cfg,
+    env_cfg: EnvConfig,
 ) -> tuple[np.ndarray, np.ndarray, list[int], list[int], list[float]]:
     features = np.zeros((env_cfg.candidate_count, candidate_feature_dim()), dtype=np.float32)
     candidate_mask = np.zeros((env_cfg.candidate_count,), dtype=bool)
@@ -297,8 +196,7 @@ def build_candidate_features(
 
     return features, candidate_mask, ship_counts, candidate_ids, target_angles
 
-
-def build_global_features(state: GameState, env_cfg) -> np.ndarray:
+def build_global_features(state: GameState, env_cfg: EnvConfig) -> np.ndarray:
     my_planets = [planet for planet in state.planets if planet.owner == state.player]
     enemy_planets = [planet for planet in state.planets if planet.owner not in {-1, state.player}]
     neutral_planets = [planet for planet in state.planets if planet.owner == -1]
@@ -317,3 +215,40 @@ def build_global_features(state: GameState, env_cfg) -> np.ndarray:
         ],
         dtype=np.float32,
     )
+
+def fixed_ship_count(src: PlanetState, tgt: PlanetState) -> int:
+    return max(tgt.ships + 1, 20)
+
+
+def distance(a: PlanetState, b: PlanetState) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def total_ships(planets: list[PlanetState]) -> float:
+    return float(sum(planet.ships for planet in planets))
+
+
+def is_rotating_planet(planet: PlanetState) -> bool:
+    dx = planet.x - BOARD_CENTER[0]
+    dy = planet.y - BOARD_CENTER[1]
+    orbital_radius = math.hypot(dx, dy)
+    return orbital_radius + planet.radius < ROTATION_RADIUS_LIMIT
+
+
+def shot_crosses_sun(src: PlanetState, angle: float, tgt: PlanetState) -> bool:
+    start_x = src.x + math.cos(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
+    start_y = src.y + math.sin(angle) * (src.radius + PLANET_LAUNCH_RADIUS_OFFSET)
+    return point_to_segment_distance(BOARD_CENTER, (start_x, start_y), (tgt.x, tgt.y)) < SUN_RADIUS
+
+def point_to_segment_distance(point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]) -> float:
+    segment_len_sq = (start[0] - end[0]) ** 2 + (start[1] - end[1]) ** 2
+    if segment_len_sq == 0.0:
+        return math.hypot(point[0] - start[0], point[1] - start[1])
+    projection = (
+        ((point[0] - start[0]) * (end[0] - start[0]) + (point[1] - start[1]) * (end[1] - start[1]))
+        / segment_len_sq
+    )
+    projection = max(0.0, min(1.0, projection))
+    closest_x = start[0] + projection * (end[0] - start[0])
+    closest_y = start[1] + projection * (end[1] - start[1])
+    return math.hypot(point[0] - closest_x, point[1] - closest_y)
