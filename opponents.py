@@ -265,7 +265,8 @@ class SelfPlayOpponent:
         self.policy.eval()
 
     def sync_from(self, source_policy: PlanetPolicy) -> None:
-        self.policy.load_state_dict(source_policy.state_dict())
+        state_dict = source_policy.state_dict()
+        self.policy.load_state_dict(state_dict)
         self.policy.eval()
 
     def act(self, observation: Any) -> list[list[float | int]]:
