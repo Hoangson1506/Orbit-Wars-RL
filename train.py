@@ -1,4 +1,5 @@
 from train_utils import *
+from agent import build_policy
 
 def main() -> None:
     args = parse_args()
@@ -12,13 +13,7 @@ def main() -> None:
     for env in envs:
         batches.append(env.reset(seed=next_seed))
         next_seed += 1
-    policy = PlanetPolicy(
-        self_dim=self_feature_dim(),
-        candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(),
-        candidate_count=cfg.env.candidate_count,
-        hidden_size=cfg.model.hidden_size,
-    ).to(device)
+    policy = build_policy(cfg=cfg, device=device)
     if isinstance(opponent, SelfPlayOpponent):
         opponent.sync_from(policy)
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)

@@ -166,10 +166,10 @@ def build_candidate_features(
         if idx >= env_cfg.candidate_count:
             break
         dx = tgt.x - src.x
-        dy = tgt.y - src.y
-        angle = math.atan2(dy, dx)
-        crosses_sun = shot_crosses_sun(src, angle, tgt)
+        dy = tgt.y - src.y 
         ships_needed = fixed_ship_count(src, tgt)
+        angle = calculate_move_angle(src, tgt, ships_needed, state.angular_velocity)
+        crosses_sun = shot_crosses_sun(src, angle, tgt)
         features[idx] = np.asarray(
             [
                 1.0,
@@ -227,6 +227,36 @@ def distance(a: PlanetState, b: PlanetState) -> float:
 def total_ships(planets: list[PlanetState]) -> float:
     return float(sum(planet.ships for planet in planets))
 
+
+def calculate_move_angle(src: PlanetState, target: PlanetState, ships_to_send: int, angular_velocity: float, max_steps = 60) -> float:
+    center_x = BOARD_CENTER[0]
+    center_y = BOARD_CENTER[1]
+    orbit_r = math.hypot(target.x - center_x, target.y - center_y)
+    is_orbiting = is_rotating_planet(target)
+
+    fleet_speed = 1.0 + 5.0 * (math.log(ships_to_send) / math.log(500)) ** 1.5
+
+    if not is_orbiting:
+        return math.atan2(target.y - src.y, target.x - src.x)
+    
+    phi = math.atan2(target.y - center_x, target.x - center_y)
+
+    for t in range(1, max_steps):
+        new_target_x = center_x + orbit_r * math.cos(phi + angular_velocity * t)
+        new_target_y = center_y + orbit_r * math.sin(phi + angular_velocity * t)
+
+        angle = math.atan2(new_target_y - src.y, new_target_x - src.x)
+
+        fleet_starting_x = src.x + src.radius * math.cos(angle)
+        fleet_starting_y = src.y + src.radius * math.sin(angle)
+
+        new_fleet_x = fleet_starting_x + fleet_speed * t * math.cos(angle)
+        new_fleet_y = fleet_starting_y + fleet_speed * t * math.sin(angle)
+
+        if math.hypot(new_fleet_x - new_target_x, new_fleet_y - new_target_y) < target.radius:
+            return angle
+
+    return math.atan2(target.y - src.y, target.x - src.x)
 
 def is_rotating_planet(planet: PlanetState) -> bool:
     dx = planet.x - BOARD_CENTER[0]

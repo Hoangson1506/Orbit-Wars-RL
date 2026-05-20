@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default=str(default_train_config_path()))
     parser.add_argument("--checkpoint", type=str, default="C:/Code/Orbit-Wars-RL/artifacts\orbit_wars_ppo/ckpt_last.pt")
     parser.add_argument("--games", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--deterministic", action="store_true")
     return parser.parse_args()
@@ -118,7 +118,7 @@ def main() -> None:
         deterministic=args.deterministic
     )
     opponent = build_opponent(
-        name="aggresive",
+        name="nearest",
         cfg=cfg,
         device=device
     )

@@ -10,7 +10,7 @@ from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
 from config import TrainConfig
 from features import encode_turn
-from policy import PlanetPolicy
+from policy import PlanetPolicy, TransformerPlanetPolicy
 from algorithms.ppo import sample_actions
 from features import TurnBatch, self_feature_dim, candidate_feature_dim, global_feature_dim
 
@@ -24,13 +24,27 @@ class Agent(Protocol):
 # PPO Agent
 # ===============================================
 def build_policy(cfg: TrainConfig, device: torch.device) -> PlanetPolicy:
-    return PlanetPolicy(
-        self_dim=self_feature_dim(),
-        candidate_dim=candidate_feature_dim(),
-        global_dim=global_feature_dim(),
-        candidate_count=cfg.env.candidate_count,
-        hidden_size=cfg.model.hidden_size,
-    ).to(device)
+    arch = cfg.model.architecture.lower()
+
+    if arch == "mlp":
+        return PlanetPolicy(
+            self_dim=self_feature_dim(),
+            candidate_dim=candidate_feature_dim(),
+            global_dim=global_feature_dim(),
+            candidate_count=cfg.env.candidate_count,
+            hidden_size=cfg.model.hidden_size,
+        ).to(device)
+    if arch == "transformer":
+        return TransformerPlanetPolicy(
+            self_dim=self_feature_dim(),
+            candidate_dim=candidate_feature_dim(),
+            global_dim=global_feature_dim(),
+            candidate_count=cfg.env.candidate_count,
+            hidden_size=cfg.model.hidden_size,
+            num_heads=cfg.model.num_heads, # Passed specific to transformer
+        ).to(device)
+    
+    raise ValueError(f"Unknown model architecture: {arch}")
 
 def register_checkpoint_module_aliases() -> None:
     sys.modules.setdefault("src", types.ModuleType("src"))

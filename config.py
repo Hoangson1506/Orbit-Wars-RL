@@ -11,7 +11,7 @@ class EnvConfig:
     episode_steps: int = 500
     candidate_count: int = 8
     ship_bucket_count: int = 8
-    max_planets: int = 48
+    max_planets: int = 40
     max_ships: float = 400.0
     max_production: float = 5.0
 
@@ -19,6 +19,8 @@ class EnvConfig:
 @dataclass(slots=True)
 class ModelConfig:
     hidden_size: int = 128
+    architecture: str = "mlp"  
+    num_heads: int = 4
 
 @dataclass(slots=True)
 class PPOConfig:
@@ -28,6 +30,7 @@ class PPOConfig:
     epochs: int = 4
     minibatch_size: int = 512
     gamma: float = 0.99
+    lmbda: float = 0.95
     clip_coef: float = 0.2
     ent_coef: float = 0.01
     vf_coef: float = 0.5

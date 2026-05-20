@@ -123,16 +123,43 @@ def collect_rollout(
             next_batches.append(next_batch)
         batches = next_batches
 
+    # Calculate Advantage
     returns: list[float] = [0.0] * len(values)
     advantages: list[float] = [0.0] * len(values)
     next_state_values = bootstrap_values(policy, batches, device)
+    # # Calculate TD Advantage (High Variance)
+    # for env_idx, groups in enumerate(groups_per_env):
+    #     future_return = next_state_values[env_idx]
+    #     for group in reversed(groups):
+    #         future_return = group.reward + cfg.ppo.gamma * future_return * (1.0 - float(group.done))
+    #         for idx in group.indices:
+    #             returns[idx] = future_return
+    #             advantages[idx] = future_return - values[idx]
+    # Calculate Generalized Advantage Estimate (Best of both TD and MC, lower bias and variance)
     for env_idx, groups in enumerate(groups_per_env):
-        future_return = next_state_values[env_idx]
+        last_gae_lam = 0.0
+        next_value = next_state_values[env_idx]
         for group in reversed(groups):
-            future_return = group.reward + cfg.ppo.gamma * future_return * (1.0 - float(group.done))
+            if not group.indices:
+                # No actions were taken. Pass the reward, discounted value, 
+                # and decayed GAE backward to the previous step.
+                next_value = group.reward + cfg.ppo.gamma * next_value * (1.0 - float(group.done))
+                last_gae_lam = cfg.ppo.gamma * cfg.ppo.lmbda * last_gae_lam * (1.0 - float(group.done))
+                continue
+            # 1. Calculate the standard TD Error
+            delta = group.reward + cfg.ppo.gamma * next_value * (1.0 - float(group.done)) - values[group.indices[0]]
+            
+            # 2. Calculate GAE recursively
+            last_gae_lam = delta + cfg.ppo.gamma * cfg.ppo.lmbda * last_gae_lam * (1.0 - float(group.done))
+            
+            # 3. Store the results (and calculate the return as Advantage + Value)
             for idx in group.indices:
-                returns[idx] = future_return
-                advantages[idx] = future_return - values[idx]
+                advantages[idx] = last_gae_lam
+                returns[idx] = last_gae_lam + values[idx]
+                
+            # The current state's value becomes the next_value for the previous step
+            next_value = values[group.indices[0]]
+
     batch = TransitionBatch(
         self_features=torch.from_numpy(np.asarray(self_rows, dtype=np.float32).reshape(-1, self_feature_dim())),
         candidate_features=torch.from_numpy(
