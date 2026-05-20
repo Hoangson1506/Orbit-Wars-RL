@@ -15,8 +15,13 @@ def train() -> None:
         batches.append(env.reset(seed=next_seed))
         next_seed += 1
     policy = build_policy(cfg=cfg, device=device)
+    
     if isinstance(opponent, SelfPlayOpponent):
+        original_sync_mode = cfg.sync_mode
+        cfg.sync_mode = "checkpoint"
         opponent.sync_from(policy)
+        cfg.sync_mode = original_sync_mode
+
     optimizer = torch.optim.Adam(policy.parameters(), lr=cfg.ppo.lr)
     save_dir = Path(cfg.save_dir)
     for update in range(1, cfg.ppo.total_updates + 1):
@@ -34,8 +39,8 @@ def train() -> None:
             minibatch_size=cfg.ppo.minibatch_size,
             device=device,
         )
-        if isinstance(opponent, SelfPlayOpponent) and update % cfg.self_play_update_interval == 0:
-            opponent.sync_from(policy)
+        if isinstance(opponent, SelfPlayOpponent):
+            opponent.sync_from(policy, update)
         if update % cfg.log_every == 0:
             print(
                 f"update={update} episode_reward_mean={stats['episode_reward_mean']:.4f} "

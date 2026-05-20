@@ -256,18 +256,29 @@ class AggressiveNearestOpponent:
     
 class SelfPlayOpponent:
     def __init__(self, cfg: TrainConfig, device: torch.device, deterministic: bool = True) -> None:
-        from features import candidate_feature_dim, global_feature_dim, self_feature_dim
-
         self.cfg = cfg
         self.device = device
         self.deterministic = deterministic
         self.policy = build_policy(cfg=cfg, device=device)
         self.policy.eval()
+        for param in self.policy.parameters():
+            param.requires_grad = False
 
-    def sync_from(self, source_policy: PlanetPolicy) -> None:
-        state_dict = source_policy.state_dict()
-        self.policy.load_state_dict(state_dict)
-        self.policy.eval()
+    def sync_from(self, source_policy: PlanetPolicy, update: int) -> None:
+        if self.cfg.sync_mode == "checkpoint":
+            if update % self.cfg.self_play_update_interval == 0:
+                state_dict = source_policy.state_dict()
+                self.policy.load_state_dict(state_dict)
+                self.policy.eval()
+
+        elif self.cfg.sync_mode == "moving_average":
+            with torch.no_grad():
+                for target_param, main_param in zip(self.policy.parameters(), source_policy.parameters()):
+                    target_param.data.copy_(
+                        self.cfg.tau * main_param.data + (1.0 - self.cfg.tau) * target_param.data
+                    )
+        else:
+            raise ValueError(f"Unknown sync_mode: {self.sync_mode}")
 
     def act(self, observation: Any) -> list[list[float | int]]:
         batch = encode_turn(observation, self.cfg.env, env_index=0)
@@ -320,3 +331,61 @@ def obs_get(observation: Any, key: str, default: Any) -> Any:
     if isinstance(observation, dict):
         return observation.get(key, default)
     return getattr(observation, key, default)
+
+# REFACTOR FOR COORDINATED POLICY
+from features import decode_network_actions
+class SelfPlayOpponent:
+    def __init__(self, cfg: "TrainConfig", device: torch.device, deterministic: bool = True) -> None:
+        self.cfg = cfg
+        self.device = device
+        self.deterministic = deterministic
+        self.policy = build_policy(cfg=cfg, device=device)
+        self.policy.eval()
+        for param in self.policy.parameters():
+            param.requires_grad = False
+
+    def sync_from(self, source_policy: PlanetPolicy, update: int = 0) -> None:
+        # (This remains exactly the same)
+        if self.cfg.sync_mode == "checkpoint":
+            if update % self.cfg.self_play_update_interval == 0:
+                state_dict = source_policy.state_dict()
+                self.policy.load_state_dict(state_dict)
+                self.policy.eval()
+
+        elif self.cfg.sync_mode == "moving_average":
+            with torch.no_grad():
+                for target_param, main_param in zip(self.policy.parameters(), source_policy.parameters()):
+                    target_param.data.copy_(
+                        self.cfg.tau * main_param.data + (1.0 - self.cfg.tau) * target_param.data
+                    )
+        else:
+            raise ValueError(f"Unknown sync_mode: {self.cfg.sync_mode}")
+
+    def act(self, observation: Any) -> list[list[float | int]]:
+        # 1. Encode the turn into the new sequence format
+        batch = encode_turn(observation, self.cfg.env, env_index=0)
+
+        # 2. Add batch dimension (B=1) and move to device
+        planet_feat = torch.from_numpy(batch.planet_features).unsqueeze(0).to(self.device)
+        global_feat = torch.from_numpy(batch.global_features).unsqueeze(0).to(self.device)
+        target_mask = torch.from_numpy(batch.target_mask).unsqueeze(0).to(self.device)
+
+        with torch.inference_mode():
+            # 3. Forward pass through the Transformer
+            outputs = self.policy(planet_feat, global_feat)
+
+            # 4. Sample sequence actions
+            sampled = sample_actions(
+                outputs, 
+                target_mask=target_mask, 
+                deterministic=self.deterministic
+            )
+
+        # 5. Extract the first (and only) item in the batch
+        target_indices = sampled.target_index[0].cpu().tolist()
+        actor_mask = batch.actor_mask.tolist()
+
+        # 6. Decode back into Kaggle moves using the shared physics helper
+        moves = decode_network_actions(target_indices, actor_mask, batch)
+
+        return moves

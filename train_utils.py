@@ -428,3 +428,172 @@ def multiprocessing_collect_rollout(
         "samples": float(len(values)),
     }
     return batch, batches, next_seed, stats
+
+
+# ==================================================
+# REFACTOR FOR COORDINATED POLICY
+# ==================================================
+from env import OrbitWarsEnv
+from features import decode_network_actions
+
+def multiprocessing_collect_rollout(
+    envs: SubprocVectorEnv,
+    batches: list[TurnBatch],
+    policy: PlanetPolicy,
+    cfg: TrainConfig,
+    device: torch.device,
+    next_seed: int,
+) -> tuple[TransitionBatch, list[TurnBatch], int, dict[str, float]]:
+    
+    num_envs = len(batches)
+    rollout_steps = cfg.ppo.rollout_steps
+    
+    # Grid storage: [rollout_steps, num_envs, ...]
+    planet_features_grid = []
+    global_features_grid = []
+    actor_mask_grid = []
+    target_mask_grid = []
+    
+    target_index_grid = []
+    log_prob_grid = []
+    
+    values_grid = np.zeros((rollout_steps, num_envs), dtype=np.float32)
+    rewards_grid = np.zeros((rollout_steps, num_envs), dtype=np.float32)
+    dones_grid = np.zeros((rollout_steps, num_envs), dtype=np.float32)
+
+    episode_rewards: list[float] = []
+    running_episode_rewards = [0.0 for _ in range(num_envs)]
+
+    for step in range(rollout_steps):
+        # 1. Prepare Batch & Forward Pass
+        merged = merge_batches(batches)
+        
+        with torch.inference_mode():
+            outputs = policy(
+                torch.from_numpy(merged.planet_features).to(device),
+                torch.from_numpy(merged.global_features).to(device),
+            )
+            # Sample action indices per planet token
+            sampled = sample_actions(
+                outputs, 
+                target_mask=torch.from_numpy(merged.target_mask).to(device),
+                deterministic=False
+            )
+            
+            val_np = outputs.value.detach().cpu().numpy()
+            target_idx_np = sampled.target_index.detach().cpu().numpy()
+            log_prob_np = sampled.log_prob.detach().cpu().numpy()
+
+        # 2. Store Turn Data
+        planet_features_grid.append(merged.planet_features)
+        global_features_grid.append(merged.global_features)
+        actor_mask_grid.append(merged.actor_mask)
+        target_mask_grid.append(merged.target_mask)
+        target_index_grid.append(target_idx_np)
+        log_prob_grid.append(log_prob_np)
+        values_grid[step] = val_np
+
+        # 3. Decode Actions for Environment
+        all_moves = []
+        for env_idx in range(num_envs):
+            moves = decode_network_actions(
+                target_indices=target_idx_np[env_idx].tolist(),
+                actor_mask=merged.actor_mask[env_idx].tolist(),
+                batch=batches[env_idx]
+            )
+            all_moves.append(moves)
+
+        # 4. Step Environments
+        results = envs.step(all_moves)
+
+        # 5. Process Results & Async Resets
+        next_batches: list[TurnBatch] = []
+        for env_idx, result in enumerate(results):
+            reward = float(result.reward)
+            done = result.done
+            
+            rewards_grid[step, env_idx] = reward
+            dones_grid[step, env_idx] = float(done)
+            running_episode_rewards[env_idx] += reward
+            
+            if done:
+                episode_rewards.append(running_episode_rewards[env_idx])
+                running_episode_rewards[env_idx] = 0.0
+                next_seed += 1
+                next_batch = envs.reset_one(env_idx, seed=next_seed)    
+            else:
+                next_batch = result.batch
+                
+            next_batches.append(next_batch)
+            
+        batches = next_batches
+
+    # --- ADVANTAGE CALCULATION (GAE) ---
+    next_values = bootstrap_values(policy, batches, device)
+    
+    returns_grid = np.zeros_like(values_grid)
+    advantages_grid = np.zeros_like(values_grid)
+    last_gae_lam = np.zeros(num_envs, dtype=np.float32)
+    
+    gamma = cfg.ppo.gamma
+    lmbda = cfg.ppo.lmbda
+
+    for t in reversed(range(rollout_steps)):
+        if t == rollout_steps - 1:
+            next_non_terminal = 1.0 - dones_grid[t]
+            next_val = next_values
+        else:
+            next_non_terminal = 1.0 - dones_grid[t]
+            next_val = values_grid[t + 1]
+            
+        delta = rewards_grid[t] + gamma * next_val * next_non_terminal - values_grid[t]
+        advantages_grid[t] = last_gae_lam = delta + gamma * lmbda * next_non_terminal * last_gae_lam
+        returns_grid[t] = advantages_grid[t] + values_grid[t]
+
+    # --- FLATTEN GRID FOR PPO BATCH ---
+    # Convert lists of shape [rollout_steps, num_envs, ...] to flattened arrays [rollout_steps * num_envs, ...]
+    def flatten_grid(grid_list):
+        return np.concatenate(grid_list, axis=0)
+
+    batch = TransitionBatch(
+        planet_features=torch.from_numpy(flatten_grid(planet_features_grid)),
+        global_features=torch.from_numpy(flatten_grid(global_features_grid)),
+        actor_mask=torch.from_numpy(flatten_grid(actor_mask_grid)),
+        target_mask=torch.from_numpy(flatten_grid(target_mask_grid)),
+        target_index=torch.from_numpy(flatten_grid(target_index_grid)),
+        log_prob=torch.from_numpy(flatten_grid(log_prob_grid)),
+        returns=torch.from_numpy(returns_grid.flatten()),
+        advantages=torch.from_numpy(advantages_grid.flatten()),
+    )
+    
+    stats = {
+        "episode_reward_mean": float(np.mean(episode_rewards)) if episode_rewards else 0.0,
+        "episodes_finished": float(len(episode_rewards)),
+        "samples": float(rollout_steps * num_envs),
+    }
+    
+    return batch, batches, next_seed, stats
+
+def merge_batches(batches: list[TurnBatch]) -> TurnBatch:
+    """Stacks lists of TurnBatches into a single batched representation."""
+    if not batches:
+        raise ValueError("batches must not be empty")
+        
+    return TurnBatch(
+        planet_features=np.stack([b.planet_features for b in batches], axis=0),
+        global_features=np.stack([b.global_features for b in batches], axis=0),
+        actor_mask=np.stack([b.actor_mask for b in batches], axis=0),
+        target_mask=np.stack([b.target_mask for b in batches], axis=0),
+        context=[b.context for b in batches], # List of contexts
+        state=[b.state for b in batches],     # List of states
+    )
+
+def bootstrap_values(policy: PlanetPolicy, batches: list[TurnBatch], device: torch.device) -> np.ndarray:
+    """Gets the value of the next state for GAE calculation."""
+    merged = merge_batches(batches)
+    with torch.inference_mode():
+        outputs = policy(
+            torch.from_numpy(merged.planet_features).to(device),
+            torch.from_numpy(merged.global_features).to(device),
+        )
+    return outputs.value.detach().cpu().numpy() # Shape: [num_envs]

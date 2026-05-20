@@ -21,6 +21,7 @@ class ModelConfig:
     hidden_size: int = 128
     architecture: str = "mlp"  
     num_heads: int = 4
+    num_layers: int = 3
 
 @dataclass(slots=True)
 class PPOConfig:
@@ -46,8 +47,10 @@ class TrainConfig:
     checkpoint_every: int = 10
     log_every: int = 1
     opponent: str = "random"
-    self_play_update_interval: int = 10
-    self_play_deterministic: bool = False
+    self_play_update_interval: int = 20
+    sync_mode: str = "moving_average"
+    tau: float = 0.05
+    self_play_deterministic: bool = True
     alternate_player_sides: bool = True
     env: EnvConfig = field(default_factory=EnvConfig)
     model: ModelConfig = field(default_factory=ModelConfig)

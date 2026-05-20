@@ -9,10 +9,10 @@ import numpy as np
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet
 
 from config import TrainConfig
-from features import encode_turn
+from features import encode_turn, decode_network_actions
 from policy import PlanetPolicy, TransformerPlanetPolicy
 from algorithms.ppo import sample_actions
-from features import TurnBatch, self_feature_dim, candidate_feature_dim, global_feature_dim
+from features import TurnBatch, self_feature_dim, candidate_feature_dim, global_feature_dim, planet_feature_dim
 
 
 class Agent(Protocol):
@@ -42,6 +42,14 @@ def build_policy(cfg: TrainConfig, device: torch.device) -> PlanetPolicy:
             candidate_count=cfg.env.candidate_count,
             hidden_size=cfg.model.hidden_size,
             num_heads=cfg.model.num_heads, # Passed specific to transformer
+        ).to(device)
+    if arch == "coordinated":
+        return TransformerPlanetPolicy(
+            planet_dim=planet_feature_dim(),
+            global_dim=global_feature_dim(),
+            hidden_size=cfg.model.hidden_size,
+            num_heads=cfg.model.num_heads, # Passed specific to transformer
+            num_layers=cfg.model.num_layers
         ).to(device)
     
     raise ValueError(f"Unknown model architecture: {arch}")
@@ -149,3 +157,49 @@ def build_agent(
             deterministic=deterministic
         )
     raise ValueError(f"Unknown opponent: {name}")
+
+class PPOAgent:
+    """Wraps a neural network policy to conform to the Agent interface."""
+    def __init__(
+        self, 
+        policy: PlanetPolicy, 
+        cfg: TrainConfig, 
+        device: torch.device, 
+        deterministic: bool
+    ):
+        self.policy = policy
+        self.cfg = cfg
+        self.device = device
+        self.deterministic = deterministic
+        self.policy.eval() # Ensure the policy is always in eval mode during inference
+
+    def act(self, obs: Any) -> list[list[float | int]]:
+        # 1. Encode the turn into the new sequence format
+        batch = encode_turn(obs, self.cfg.env, env_index=0)
+        return self._build_moves(batch)
+    
+    def _build_moves(self, batch: TurnBatch) -> list[list[float | int]]:
+        # 2. Add batch dimension (B=1) and move to device
+        planet_feat = torch.from_numpy(batch.planet_features).unsqueeze(0).to(self.device)
+        global_feat = torch.from_numpy(batch.global_features).unsqueeze(0).to(self.device)
+        target_mask = torch.from_numpy(batch.target_mask).unsqueeze(0).to(self.device)
+
+        with torch.inference_mode():
+            # 3. Forward pass through the Transformer
+            outputs = self.policy(planet_feat, global_feat)
+
+            # 4. Sample sequence actions
+            sampled = sample_actions(
+                outputs, 
+                target_mask=target_mask, 
+                deterministic=self.deterministic
+            )
+
+        # 5. Extract the first (and only) item in the batch
+        target_indices = sampled.target_index[0].cpu().tolist()
+        actor_mask = batch.actor_mask.tolist()
+
+        # 6. Decode back into Kaggle moves using the shared physics helper
+        moves = decode_network_actions(target_indices, actor_mask, batch)
+
+        return moves

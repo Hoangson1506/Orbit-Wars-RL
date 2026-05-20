@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -73,95 +74,113 @@ class PlanetPolicy(nn.Module):
 class TransformerPlanetPolicy(nn.Module):
     def __init__(
         self,
-        self_dim: int,
-        candidate_dim: int,
+        planet_dim: int,
         global_dim: int,
-        candidate_count: int,
         hidden_size: int = 128,
         num_heads: int = 4,
+        num_layers: int = 3
     ) -> None:
         super().__init__()
-        self.candidate_count = candidate_count
         
-        self.self_encoder = nn.Sequential(
-            nn.Linear(self_dim, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
+        # 1. Feature Encoders
+        self.planet_encoder = nn.Sequential(
+            nn.Linear(planet_dim, hidden_size), 
+            nn.LayerNorm(hidden_size), 
+            nn.GELU()
         )
         self.global_encoder = nn.Sequential(
-            nn.Linear(global_dim, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
-        )
-        self.candidate_encoder = nn.Sequential(
-            nn.Linear(candidate_dim, hidden_size), nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
+            nn.Linear(global_dim, hidden_size), 
+            nn.LayerNorm(hidden_size), 
+            nn.GELU()
         )
         
-        # 2. Query Projection: Combines Self + Global into a single Query
-        self.query_proj = nn.Linear(hidden_size * 2, hidden_size)
-        
-        # 3. Cross-Attention Module
-        self.mha = nn.MultiheadAttention(
-            embed_dim=hidden_size, 
-            num_heads=num_heads, 
-            batch_first=True
+        # 2. Deep Contextualization Stack
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=num_heads,
+            dim_feedforward=hidden_size * 4,
+            batch_first=True,
+            norm_first=True,  
+            activation="gelu"
         )
-        
-        # 4. Heads
-        self.target_head = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, 1),
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers, 
+            enable_nested_tensor=False
         )
+        self.final_ln = nn.LayerNorm(hidden_size)
         
-        # 5. Value
+        # 3. Action Heads (Actor via Pointer Network)
+        # Extracts "sender" representation for a planet
+        self.actor_query = nn.Linear(hidden_size, hidden_size) 
+        # Extracts "target" representation for a planet
+        self.actor_key = nn.Linear(hidden_size, hidden_size)   
+        
+        # 4. Value Head (Critic)
         self.value_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1),
         )
+
+        # Initialize final layers to prevent massive gradients early on
+        nn.init.orthogonal_(self.value_head[-1].weight, gain=1.0)
+        nn.init.constant_(self.value_head[-1].bias, 0.0)
+        
+        # Initialize actor heads closer to zero for flat starting probabilities
+        nn.init.orthogonal_(self.actor_query.weight, gain=0.01)
+        nn.init.orthogonal_(self.actor_key.weight, gain=0.01)
 
     def forward(
         self,
-        self_features: torch.Tensor,
-        candidate_features: torch.Tensor,
+        planet_features: torch.Tensor,
         global_features: torch.Tensor,
-        candidate_mask: torch.Tensor,
+        target_mask: torch.Tensor | None = None,
     ) -> PolicyOutput:
-        # Encode features
-        self_hidden = self.self_encoder(self_features)          # [B, H]
-        global_hidden = self.global_encoder(global_features)    # [B, H]
-        cand_hidden = self.candidate_encoder(candidate_features)# [B, N, H]
-
-        # 1. Build the Query
-        # Combine self and global, then add a sequence dimension
-        query_context = torch.cat([self_hidden, global_hidden], dim=-1)
-        query = self.query_proj(query_context).unsqueeze(1)     # [B, 1, H]
-
-        # 2. Apply Cross-Attention
-        # PyTorch MHA's key_padding_mask expects True for elements to IGNORE.
-        # Your candidate_mask likely uses True for VALID candidates, so we invert it (~).
-        padding_mask = ~candidate_mask
-
-        # attended_context is the attention-weighted sum of candidate features
-        attended_context, _ = self.mha(
-            query=query,
-            key=cand_hidden,
-            value=cand_hidden,
-            key_padding_mask=padding_mask
-        ) # [B, 1, H]
-
-        # 3. Predict State Value
-        value = self.value_head(attended_context.squeeze(1)).squeeze(-1)  # [B, H] -> [B] 
-
-        # 4. Predict Target Logits
-        # Expand the query to match the number of candidates
-        expanded_query = query.expand(-1, self.candidate_count, -1) # [B, N, H]
         
-        # Concatenate the Query context with each Candidate's Key
-        joint = torch.cat([expanded_query, cand_hidden], dim=-1)    # [B, N, 2H]
-        target_logits = self.target_head(joint).squeeze(-1)         # [B, N]
+        B, N, _ = planet_features.shape
+        
+        # --- 1. Embedding Stage ---
+        planet_emb = self.planet_encoder(planet_features) # [B, N, H]
+        
+        # The global features become token index 0 (The [CLS] token)
+        global_emb = self.global_encoder(global_features).unsqueeze(1) # [B, 1, H]
+        
+        # Build the Sequence: [Global_CLS, Planet_1, Planet_2, ..., Planet_N]
+        seq = torch.cat([global_emb, planet_emb], dim=1)  # [B, N+1, H]
+        
+        # --- 2. Masking ---
+        # If a target mask is provided, tell the transformer to ignore padded zeros
+        # PyTorch transformers require True for elements to IGNORE.
+        if target_mask is not None:
+            # The CLS token (index 0) is always valid
+            cls_mask = torch.zeros((B, 1), dtype=torch.bool, device=seq.device)
+            # Invert target_mask so valid planets=False, padded planets=True
+            padding_mask = torch.cat([cls_mask, ~target_mask], dim=1) # [B, N+1]
+        else:
+            padding_mask = None
 
-        # Apply the hard mask to ensure illegal moves are never sampled
-        target_logits = target_logits.masked_fill(padding_mask, torch.finfo(target_logits.dtype).min)
-
+        # --- 3. Attention & Coordination ---
+        seq_out = self.transformer(seq, src_key_padding_mask=padding_mask)
+        seq_out = self.final_ln(seq_out)
+        
+        # Split the sequence back apart
+        cls_out = seq_out[:, 0, :]   # [B, H]
+        planet_out = seq_out[:, 1:, :] # [B, N, H]
+        
+        # --- 4. Critic Estimation ---
+        # The value is derived from the globally-aware CLS token
+        value = self.value_head(cls_out).squeeze(-1) # [B]
+        
+        # --- 5. Actor Target Selection ---
+        # Instead of fixed target logits, planets evaluate each other.
+        Q = self.actor_query(planet_out) # Who wants to send ships [B, N, H]
+        K = self.actor_key(planet_out)   # Who looks like a good target [B, N, H]
+        
+        # Calculate Dot-Product Attention: 
+        # Planet i's Query dot Planet j's Key creates the logit for i -> j
+        d_k = Q.size(-1)
+        target_logits = torch.bmm(Q, K.transpose(1, 2)) / math.sqrt(d_k) # [B, N, N]
+        
         return PolicyOutput(target_logits=target_logits, value=value)

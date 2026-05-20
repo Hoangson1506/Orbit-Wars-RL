@@ -282,3 +282,184 @@ def point_to_segment_distance(point: tuple[float, float], start: tuple[float, fl
     closest_x = start[0] + projection * (end[0] - start[0])
     closest_y = start[1] + projection * (end[1] - start[1])
     return math.hypot(point[0] - closest_x, point[1] - closest_y)
+
+
+
+# ==================================================
+# REFACTOR FOR COORDINATED POLICY
+# ==================================================
+@dataclass(slots=True)
+class DecisionContext:
+    env_index: int
+    # Maps the padded tensor index (0 to MAX_PLANETS-1) to the actual game Planet ID
+    index_to_id: list[int] 
+    # Store angles/ships needed for the action decoder to use later
+    angular_velocity: float
+
+@dataclass(slots=True)
+class TurnBatch:
+    # Shape: [MAX_PLANETS, planet_feature_dim]
+    planet_features: np.ndarray 
+    # Shape: [global_feature_dim]
+    global_features: np.ndarray 
+    # Shape: [MAX_PLANETS] - True if planet is owned and can act
+    actor_mask: np.ndarray 
+    # Shape: [MAX_PLANETS] - True if planet exists and can be targeted
+    target_mask: np.ndarray 
+    context: DecisionContext
+    state: GameState
+
+def planet_feature_dim() -> int:
+    # [is_owned, is_enemy, is_neutral, x, y, radius, ships, prod, is_rotating, incoming_allied, incoming_enemy]
+    return 11
+
+def global_feature_dim() -> int:
+    return 8
+
+def encode_turn(
+    observation: Any,
+    env_cfg: EnvConfig,
+    *,
+    env_index: int = 0,
+) -> TurnBatch:
+    state = observation if isinstance(observation, GameState) else parse_observation(observation)
+    
+    # 1. Sort all planets deterministically by ID so the Transformer sequence is consistent
+    all_planets = sorted(state.planets, key=lambda p: p.id)
+    
+    # Initialize zero-padded arrays for static graph/sequence sizes
+    planet_features = np.zeros((env_cfg.max_planets, planet_feature_dim()), dtype=np.float32)
+    actor_mask = np.zeros((env_cfg.max_planets,), dtype=bool)
+    target_mask = np.zeros((env_cfg.max_planets,), dtype=bool)
+    index_to_id = [-1] * env_cfg.max_planets
+
+    # 2. Build Sequence Tokens
+    for idx, planet in enumerate(all_planets):
+        if idx >= env_cfg.max_planets:
+            break
+            
+        planet_features[idx] = build_planet_features(planet, state, env_cfg)
+        
+        is_owned = (planet.owner == state.player)
+        
+        # A planet can act if we own it and it has ships
+        actor_mask[idx] = is_owned and planet.ships > 0 
+        
+        # Any valid planet can be a target (you might want to mask out attacking yourself later in the action space)
+        target_mask[idx] = True 
+        index_to_id[idx] = planet.id
+
+    # 3. Global Features
+    global_features = build_global_features(state, env_cfg)
+
+    context = DecisionContext(
+        env_index=env_index,
+        index_to_id=index_to_id,
+        angular_velocity=state.angular_velocity
+    )
+
+    return TurnBatch(
+        planet_features=planet_features,
+        global_features=global_features,
+        actor_mask=actor_mask,
+        target_mask=target_mask,
+        context=context,
+        state=state,
+    )
+
+def build_planet_features(planet: PlanetState, state: GameState, env_cfg: EnvConfig) -> np.ndarray:
+    """Builds an absolute feature representation for a single planet token."""
+    
+    # TODO: Calculate these by iterating through state.fleets to see what is arriving here
+    incoming_allied_ships = 0.0 
+    incoming_enemy_ships = 0.0
+
+    return np.asarray(
+        [
+            1.0 if planet.owner == state.player else 0.0,
+            1.0 if planet.owner not in {-1, state.player} else 0.0,
+            1.0 if planet.owner == -1 else 0.0,
+            planet.x / env_cfg.board_size,
+            planet.y / env_cfg.board_size,
+            planet.radius / 5.0,
+            min(planet.ships, env_cfg.max_ships) / env_cfg.max_ships,
+            planet.production / env_cfg.max_production,
+            1.0 if is_rotating_planet(planet) else 0.0,
+            incoming_allied_ships / env_cfg.max_ships,
+            incoming_enemy_ships / env_cfg.max_ships,
+        ],
+        dtype=np.float32,
+    )
+
+def build_global_features(state: GameState, env_cfg: EnvConfig) -> np.ndarray:
+    my_planets = [p for p in state.planets if p.owner == state.player]
+    enemy_planets = [p for p in state.planets if p.owner not in {-1, state.player}]
+    neutral_planets = [p for p in state.planets if p.owner == -1]
+    my_fleets = [f for f in state.fleets if f.owner == state.player]
+    enemy_fleets = [f for f in state.fleets if f.owner != state.player]
+    
+    return np.asarray(
+        [
+            state.step / env_cfg.episode_steps,
+            len(my_planets) / env_cfg.max_planets,
+            len(enemy_planets) / env_cfg.max_planets,
+            len(neutral_planets) / env_cfg.max_planets,
+            sum(p.ships for p in my_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+            sum(p.ships for p in enemy_planets) / (env_cfg.max_planets * env_cfg.max_ships),
+            sum(f.ships for f in my_fleets) / (env_cfg.max_planets * env_cfg.max_ships),
+            sum(f.ships for f in enemy_fleets) / (env_cfg.max_planets * env_cfg.max_ships),
+        ],
+        dtype=np.float32,
+    )
+
+# --- Action Decoding Helper ---
+def decode_network_actions(
+    target_indices: list[int], 
+    actor_mask: list[bool], 
+    batch: TurnBatch
+) -> list[list[float | int]]:
+    """
+    Translates the neural network's sequence-based outputs back into Kaggle Actions.
+    You will call this in your training loop before passing the result to env.step()
+    """
+    actions = []
+    state = batch.state
+    context = batch.context
+    
+    # Map from Kaggle ID to PlanetState object for fast lookup
+    planet_map = {p.id: p for p in state.planets}
+    
+    for seq_idx, target_seq_idx in enumerate(target_indices):
+        # Skip if this token was padded, unowned, or had 0 ships
+        if not actor_mask[seq_idx]:
+            continue
+            
+        src_id = context.index_to_id[seq_idx]
+        tgt_id = context.index_to_id[target_seq_idx]
+        
+        # No-Op if it targets itself or targets a padded index (-1)
+        if src_id == tgt_id or tgt_id == -1:
+            continue
+            
+        src_planet = planet_map[src_id]
+        tgt_planet = planet_map[tgt_id]
+        
+        ships_needed = fixed_ship_count(src_planet, tgt_planet)
+        
+        # Validate ship count
+        if src_planet.ships < ships_needed:
+            continue
+            
+        # Calculate interception physics
+        angle = calculate_move_angle(src_planet, tgt_planet, ships_needed, context.angular_velocity)
+        
+        # Validate sun collision
+        if shot_crosses_sun(src_planet, angle, tgt_planet):
+            continue
+            
+        actions.append([src_id, tgt_id, ships_needed])
+        
+        # Prevent the same source from firing multiple times per turn in simulation
+        src_planet.ships -= ships_needed
+        
+    return actions
