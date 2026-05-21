@@ -31,9 +31,11 @@ class AggressiveNearestAgent(BaseAgent):
         owned_planets = []
         target_planets = []
         for p in planets:
-            if p.owner == player:
+            if p.id in comets:
+                continue
+            elif p.owner == player:
                 owned_planets.append(p)
-            elif p.id not in comets:
+            else:
                 if p.owner == -1 and p.ships > self.max_neutral:
                     continue
                 else:
