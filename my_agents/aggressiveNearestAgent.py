@@ -187,6 +187,8 @@ class AggressiveNearestAgent(BaseAgent):
         orbiting_target_indexes = [i for id, i in target_indexes.items() if id in self.orbiting_planets]
         static_target_indexes = [i for id, i in target_indexes.items() if id not in self.orbiting_planets]
         for i, op in enumerate(owned_planets):
+            if op.id in self.orbiting_planets:
+                continue 
             # check if there is any target in range
             static_target_in_range = np.any(distance_matrix[i, static_target_indexes] <= self.static_max_distance)
             orbiting_target_in_range = np.any(distance_matrix[i, orbiting_target_indexes] <= self.dynamic_max_distance)
@@ -208,30 +210,26 @@ class AggressiveNearestAgent(BaseAgent):
                 else:
                     break
             if candidates:
-                send = math.floor(ships_available[op.id] / len(candidates))
+                send = math.floor((ships_available[op.id] - self.max_neutral) / len(candidates))
                 if send >= self.min_ships:
                     for j in candidates:
                         result = compute_move_angle(op, owned_planets[j], send, planets, self.orbiting_planets, comets, self.angular_velocity, self.max_turns)
                         if result is not None:
                             ships_available[op.id]-= send
                             moves.append((op.id, result[0], send))
-                            # self.awaiting_results[self.owned_planets[j].id] = [result[1], self.owned_planets[j].owner]
             else:
                 # try to send to 2 nearset owned orbiting planets as they are the attacker
-                # if it is already orbiting, don't send anything
-                if op.id not in self.orbiting_planets:
-                    send = math.floor(ships_available[op.id] / 2)
-                    if send >= self.min_ships:
-                        count = 0
-                        for j in sorted_indices[1:]:
-                            if count > 1:
-                                break
-                            if owned_planets[j].id in self.orbiting_planets:
-                                result = compute_move_angle(op, owned_planets[j], send, planets, self.orbiting_planets, comets, self.angular_velocity, self.max_turns)
-                                if result is not None:
-                                    count +=1
-                                    ships_available[op.id] -= send
-                                    moves.append((op.id, result[0], send))
-                                    # self.awaiting_results[self.owned_planets[j].id] = [result[1], self.owned_planets[j].owner]
+                send = math.floor((ships_available[op.id] - self.max_neutral) / 2)
+                if send >= self.min_ships:
+                    count = 0
+                    for j in sorted_indices[1:]:
+                        if count > 1:
+                            break
+                        if owned_planets[j].id in self.orbiting_planets:
+                            result = compute_move_angle(op, owned_planets[j], send, planets, self.orbiting_planets, comets, self.angular_velocity, self.max_turns)
+                            if result is not None:
+                                count +=1
+                                ships_available[op.id] -= send
+                                moves.append((op.id, result[0], send))
 
         return moves
