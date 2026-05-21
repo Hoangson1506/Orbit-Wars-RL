@@ -1,7 +1,7 @@
 import math
 from collections import defaultdict
 
-from physics import *
+from heuristic.physics import *
 
 # ============================================================
 # World Model
