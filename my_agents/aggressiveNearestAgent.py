@@ -7,7 +7,7 @@ import numpy as np
 
 @register_model("AggressiveNearestAgent")
 class AggressiveNearestAgent(BaseAgent):
-    def __init__(self, static_max_distance=40, dynamic_max_distance=30, min_ships=5, max_turns=20, max_neutral=35, **kwargs):
+    def __init__(self, static_max_distance=40, dynamic_max_distance=30, min_ships=5, max_turns=20, max_neutral=40, **kwargs):
         super().__init__()
         self.awaiting_results = {}
         self.dynamic_max_distance=dynamic_max_distance
@@ -189,8 +189,6 @@ class AggressiveNearestAgent(BaseAgent):
         orbiting_target_indexes = [i for id, i in target_indexes.items() if id in self.orbiting_planets]
         static_target_indexes = [i for id, i in target_indexes.items() if id not in self.orbiting_planets]
         for i, op in enumerate(owned_planets):
-            if op.id in self.orbiting_planets:
-                continue 
             # check if there is any target in range
             static_target_in_range = np.any(distance_matrix[i, static_target_indexes] <= self.static_max_distance)
             orbiting_target_in_range = np.any(distance_matrix[i, orbiting_target_indexes] <= self.dynamic_max_distance)
@@ -220,6 +218,8 @@ class AggressiveNearestAgent(BaseAgent):
                             ships_available[op.id]-= send
                             moves.append((op.id, result[0], send))
             else:
+                if op.id in self.orbiting_planets:
+                    continue 
                 # try to send to 2 nearset owned orbiting planets as they are the attacker
                 send = math.floor((ships_available[op.id] - self.max_neutral) / 2)
                 if send >= self.min_ships:
