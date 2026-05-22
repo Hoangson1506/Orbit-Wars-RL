@@ -131,3 +131,33 @@ def compute_move_angle(op, tp, send, planets, orbiting_planets, comets, angular_
                 return angle, t / 2
 
     return None
+
+def get_fleet_destination(fleet, planets, orbiting_planets, comets, angular_velocity, sun, max_look_ahead):
+    ships = fleet.ships
+    x = fleet.x
+    y = fleet.y
+    angle = fleet.angle
+    origin = fleet.from_planet_id
+
+    fleet_speed = 1.0 + 5.0 * (math.log(ships) / math.log(1000)) ** 1.5
+    remaining_turns = 501
+    target = None
+
+    # check where it's going
+    dynamic_result =  orbiting_collision_check(x, y, angle, fleet_speed, origin, planets, orbiting_planets, comets, angular_velocity, max_look_ahead)
+    if dynamic_result is not None:
+        if dynamic_result[1] < remaining_turns:
+            target = dynamic_result[0]
+            remaining_turns = dynamic_result[1]
+    static_result = static_collision_check(x, y, angle, fleet_speed, origin, planets + [sun], orbiting_planets)
+    if static_result is not None:
+        if static_result[0] == -1 and static_result[1] < remaining_turns: # hit the sun first
+            target = None
+        if static_result[1] < remaining_turns:
+            target = static_result[0]
+            remaining_turns = static_result[1]
+
+    if target is not None:
+        return target, remaining_turns
+    
+    return None
