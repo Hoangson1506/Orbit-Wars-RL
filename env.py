@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
+from types import FunctionType
 
 from config import TrainConfig
 from features import TurnBatch, encode_turn
@@ -61,7 +62,10 @@ class OrbitWarsEnv:
     def step(self, player_action: list[list[float | int]]) -> StepResult:
         if self.env is None:
             raise RuntimeError("Call reset() before step().")
-        opponent_action = self.opponent.act(self.last_opp_obs)
+        if isinstance(self.opponent, FunctionType):
+            opponent_action = self.opponent(self.last_opp_obs)
+        else:
+            opponent_action = self.opponent.act(self.last_opp_obs)
         if self.learner_player == 0:
             joint_action = [player_action, opponent_action]
         else:
@@ -176,7 +180,10 @@ class OrbitWarsEnv:
         if self.env is None:
             raise RuntimeError("Call reset() before step().")
             
-        opponent_action = self.opponent.act(self.last_opp_obs)
+        if isinstance(self.opponent, FunctionType):
+            opponent_action = self.opponent(self.last_opp_obs)
+        else:
+            opponent_action = self.opponent.act(self.last_opp_obs)
         
         if self.learner_player == 0:
             joint_action = [player_action, opponent_action]

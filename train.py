@@ -1,6 +1,7 @@
 from train_utils import *
 from agent import build_policy
 from functools import partial
+import multiprocessing as mp
 
 def train() -> None:
     args = parse_args()
@@ -56,7 +57,7 @@ def multiprocessing_train() -> None:
     seed_everything(cfg.seed)
     device = resolve_device(cfg.device)
 
-    env_fns = [partial(build_single_env, idx, cfg, device) for idx in range(cfg.ppo.num_envs)]
+    env_fns = [partial(build_single_env, idx, cfg, "cpu") for idx in range(cfg.ppo.num_envs)]
     envs = SubprocVectorEnv(env_fns)
 
     next_seed = cfg.seed
@@ -105,4 +106,5 @@ def multiprocessing_train() -> None:
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     multiprocessing_train()

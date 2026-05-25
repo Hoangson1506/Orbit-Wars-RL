@@ -4,7 +4,7 @@ device: auto
 save_dir: artifacts/
 checkpoint_every: 50
 log_every: 1
-opponent: self
+opponent: heuristic
 self_play_update_interval: 20
 sync_mode: "moving_average"
 tau: 0.04
@@ -23,7 +23,7 @@ model:
 
 ppo:
   rollout_steps: 64
-  num_envs: 10
+  num_envs: 8
   total_updates: 2000 # Note: For this public Notebook, total_updates is set to 100 to keep runtime short. For full training, increase it to 2000.
 
   epochs: 4
@@ -33,5 +33,5 @@ ppo:
   clip_coef: 0.2
   ent_coef: 1e-3
   vf_coef: 0.5
-  lr: 0.0003
+  lr: 2e-4
   max_grad_norm: 1.0

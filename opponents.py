@@ -10,6 +10,7 @@ from features import encode_turn
 from agent import build_policy
 from policy import PlanetPolicy
 from algorithms.ppo import sample_actions
+from heuristic.heuristic import agent
 
 
 class OpponentPolicy(Protocol):
@@ -320,6 +321,8 @@ def build_opponent(
         return AggressiveNearestOpponent()
     if name == "nearest":
         return NearestPlanetOpponent()
+    if name == "heuristic":
+        return agent
     if name == "self":
         if cfg is None or device is None:
             raise ValueError("cfg and device are required for self opponent")
