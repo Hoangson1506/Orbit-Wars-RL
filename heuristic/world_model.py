@@ -1,15 +1,14 @@
 import math
 from collections import defaultdict
 
-from physics import *
+from heuristic.physics import *
+
 
 # ============================================================
 # World Model
 # ============================================================
 
 def fleet_target_planet(fleet, planets):
-    # Project in-flight fleets by ray-circle hit timing to build a usable
-    # arrival ledger.
     best_planet = None
     best_time = 1e9
     dir_x = math.cos(fleet.angle)
@@ -48,8 +47,6 @@ def build_arrival_ledger(fleets, planets):
 
 
 def resolve_arrival_event(owner, garrison, arrivals):
-    # Match the environment's same-turn combat order: aggregate by owner, let
-    # the top two attackers cancel, then resolve the survivor against garrison.
     by_owner = {}
     for _, attacker_owner, ships in arrivals:
         by_owner[attacker_owner] = by_owner.get(attacker_owner, 0) + ships
@@ -98,8 +95,6 @@ def normalize_arrivals(arrivals, horizon):
 
 
 def simulate_planet_timeline(planet, arrivals, player, horizon):
-    # Build one reusable future timeline so defense, capture, and evacuation
-    # all query the same state model.
     horizon = max(0, int(math.ceil(horizon)))
     events = normalize_arrivals(arrivals, horizon)
     by_turn = defaultdict(list)
@@ -137,7 +132,6 @@ def simulate_planet_timeline(planet, arrivals, player, horizon):
     holds_full = True
 
     if planet.owner == player:
-
         def survives_with_keep(keep):
             sim_owner = planet.owner
             sim_garrison = float(keep)
@@ -220,6 +214,30 @@ def indirect_features(planet, planets, player):
     return friendly, neutral, enemy
 
 
+def detect_exposed_enemy_planets(fleets, enemy_planets):
+    exposed = set()
+    for planet in enemy_planets:
+        outbound = sum(
+            int(f.ships)
+            for f in fleets
+            if f.owner == planet.owner and f.from_planet_id == planet.id and f.ships >= 5
+        )
+        if outbound >= 12 and outbound >= planet.ships * 0.8:  # lowered threshold
+            exposed.add(planet.id)
+    return exposed
+
+
+def _compute_weakest_enemy(enemy_planets, owner_strength, owner_production):
+    """Return the player ID of the weakest enemy (lowest ships + future production)."""
+    enemy_owners = set(p.owner for p in enemy_planets)
+    if not enemy_owners:
+        return None
+    return min(
+        enemy_owners,
+        key=lambda owner: owner_strength.get(owner, 0) + owner_production.get(owner, 0) * 15,
+    )
+
+
 class WorldModel:
     def __init__(self, player, step, planets, fleets, initial_by_id, ang_vel, comets, comet_ids):
         self.player = player
@@ -239,12 +257,18 @@ class WorldModel:
             planet for planet in self.neutral_planets if is_static_planet(planet)
         ]
 
+        # Per-opponent grouping for reinforcement analysis (from ykhnkf)
+        self.opp_planets = defaultdict(list)
+        for p in self.enemy_planets:
+            self.opp_planets[p.owner].append(p)
+
         self.num_players = count_players(planets, fleets)
         self.remaining_steps = max(1, TOTAL_STEPS - step)
         self.is_early = step < EARLY_TURN_LIMIT
         self.is_opening = step < OPENING_TURN_LIMIT
         self.is_late = self.remaining_steps < LATE_REMAINING_TURNS
         self.is_very_late = self.remaining_steps < VERY_LATE_REMAINING_TURNS
+        self.is_total_war = self.remaining_steps < TOTAL_WAR_REMAINING_TURNS
         self.is_four_player = self.num_players >= 4
 
         self.owner_strength = defaultdict(int)
@@ -269,6 +293,15 @@ class WorldModel:
             production
             for owner, production in self.owner_production.items()
             if owner != player
+        )
+
+        # Weakest enemy tracking (key for 4P elimination strategy)
+        self._weakest_enemy = _compute_weakest_enemy(
+            self.enemy_planets, self.owner_strength, self.owner_production
+        )
+        self._weakest_enemy_strength = (
+            self.owner_strength.get(self._weakest_enemy, 0)
+            if self._weakest_enemy is not None else 0
         )
 
         self.arrivals_by_planet = build_arrival_ledger(fleets, planets)
@@ -299,6 +332,7 @@ class WorldModel:
         self.indirect_feature_map = {
             planet.id: indirect_features(planet, planets, player) for planet in planets
         }
+        self.exposed_planet_ids = detect_exposed_enemy_planets(fleets, self.enemy_planets)
         self.shot_cache = {}
         self.probe_candidate_cache = {}
         self.best_probe_cache = {}
@@ -322,54 +356,39 @@ class WorldModel:
     def plan_shot(self, src_id, target_id, ships):
         ships = int(ships)
         key = (src_id, target_id, ships)
-        cached = self.shot_cache.get(key)
         if key in self.shot_cache:
-            return cached
+            return self.shot_cache[key]
         src = self.planet_by_id[src_id]
         target = self.planet_by_id[target_id]
         result = aim_with_prediction(
-            src,
-            target,
-            ships,
-            self.initial_by_id,
-            self.ang_vel,
-            self.comets,
-            self.comet_ids,
+            src, target, ships, self.initial_by_id, self.ang_vel, self.comets, self.comet_ids,
         )
         self.shot_cache[key] = result
         return result
 
     def probe_ship_candidates(self, src_id, target_id, source_cap, hints=()):
-        cache = getattr(self, "probe_candidate_cache", None)
-        if cache is None:
-            cache = {}
-            self.probe_candidate_cache = cache
         source_cap = max(1, int(source_cap))
         normalized_hints = tuple(
-            int(math.ceil(hint))
-            for hint in hints
-            if hint is not None
+            int(math.ceil(hint)) for hint in hints if hint is not None
         )
         cache_key = (src_id, target_id, source_cap, normalized_hints)
-        cached = cache.get(cache_key)
+        cached = self.probe_candidate_cache.get(cache_key)
         if cached is not None:
             return cached
         target = self.planet_by_id[target_id]
         target_ships = max(1, int(math.ceil(target.ships)))
 
         values = set(range(1, min(6, source_cap) + 1))
-        values.update(
-            {
-                source_cap,
-                max(1, source_cap // 2),
-                max(1, source_cap // 3),
-                min(source_cap, PARTIAL_SOURCE_MIN_SHIPS),
-                min(source_cap, target_ships + 1),
-                min(source_cap, target_ships + 2),
-                min(source_cap, target_ships + 4),
-                min(source_cap, target_ships + 8),
-            }
-        )
+        values.update({
+            source_cap,
+            max(1, source_cap // 2),
+            max(1, source_cap // 3),
+            min(source_cap, PARTIAL_SOURCE_MIN_SHIPS),
+            min(source_cap, target_ships + 1),
+            min(source_cap, target_ships + 2),
+            min(source_cap, target_ships + 4),
+            min(source_cap, target_ships + 8),
+        })
 
         for hint in normalized_hints:
             base = max(1, min(source_cap, hint))
@@ -379,7 +398,7 @@ class WorldModel:
                     values.add(candidate)
 
         result = sorted(values)
-        cache[cache_key] = result
+        self.probe_candidate_cache[cache_key] = result
         return result
 
     def best_probe_aim(
@@ -403,12 +422,8 @@ class WorldModel:
             anchor_turn,
             max_anchor_diff,
         )
-        cache = getattr(self, "best_probe_cache", None)
-        if cache is None:
-            cache = {}
-            self.best_probe_cache = cache
-        if cache_key in cache:
-            return cache[cache_key]
+        if cache_key in self.best_probe_cache:
+            return self.best_probe_cache[cache_key]
 
         best = None
         best_key = None
@@ -439,7 +454,7 @@ class WorldModel:
                 best_key = key
                 best = (ships, (angle, turns, dist_to_target, path_target))
 
-        cache[cache_key] = best
+        self.best_probe_cache[cache_key] = best
         return best
 
     def reaction_times(self, target_id):
@@ -507,9 +522,7 @@ class WorldModel:
         planned_commitments = planned_commitments or {}
         if planned_commitments.get(target_id):
             tl = self.projected_timeline(
-                target_id,
-                horizon,
-                planned_commitments=planned_commitments,
+                target_id, horizon, planned_commitments=planned_commitments,
             )
         else:
             tl = self.base_timeline[target_id]
@@ -544,11 +557,7 @@ class WorldModel:
             return self._ownership_search_cap(eval_turn) + 1
 
         normalized_extra = tuple(
-            (
-                max(1, int(math.ceil(turns))),
-                owner,
-                int(ships),
-            )
+            (max(1, int(math.ceil(turns))), owner, int(ships))
             for turns, owner, ships in extra_arrivals
             if ships > 0 and max(1, int(math.ceil(turns))) <= eval_turn
         )

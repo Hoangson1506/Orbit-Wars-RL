@@ -58,15 +58,8 @@ def actual_path_geometry(sx, sy, sr, tx, ty, tr):
 
 
 def safe_angle_and_distance(sx, sy, sr, tx, ty, tr):
-    # Launch from the source boundary and time the route to the first hit on
-    # the target circle.
     angle, start_x, start_y, end_x, end_y, hit_distance = actual_path_geometry(
-        sx,
-        sy,
-        sr,
-        tx,
-        ty,
-        tr,
+        sx, sy, sr, tx, ty, tr,
     )
     if segment_hits_sun(start_x, start_y, end_x, end_y):
         return None
@@ -120,8 +113,6 @@ def comet_remaining_life(planet_id, comets):
 
 
 def estimate_arrival(sx, sy, sr, tx, ty, tr, ships):
-    # Use one boundary-aware ETA model for routing, ranking, reserve, and
-    # launch decisions.
     safe = safe_angle_and_distance(sx, sy, sr, tx, ty, tr)
     if safe is None:
         return None
@@ -154,8 +145,6 @@ def target_can_move(target, initial_by_id, comet_ids):
 
 
 def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
-    # If the direct line is unsafe, scan future positions and keep the earliest
-    # viable intercept window.
     best = None
     best_score = None
     max_turns = min(HORIZON, ROUTE_SEARCH_HORIZON)
@@ -164,12 +153,7 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
 
     for candidate_turns in range(1, max_turns + 1):
         pos = predict_target_position(
-            target,
-            candidate_turns,
-            initial_by_id,
-            ang_vel,
-            comets,
-            comet_ids,
+            target, candidate_turns, initial_by_id, ang_vel, comets, comet_ids,
         )
         if pos is None:
             continue
@@ -182,24 +166,13 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
 
         actual_turns = max(turns, candidate_turns)
         actual_pos = predict_target_position(
-            target,
-            actual_turns,
-            initial_by_id,
-            ang_vel,
-            comets,
-            comet_ids,
+            target, actual_turns, initial_by_id, ang_vel, comets, comet_ids,
         )
         if actual_pos is None:
             continue
 
         confirm = estimate_arrival(
-            src.x,
-            src.y,
-            src.radius,
-            actual_pos[0],
-            actual_pos[1],
-            target.radius,
-            ships,
+            src.x, src.y, src.radius, actual_pos[0], actual_pos[1], target.radius, ships,
         )
         if confirm is None:
             continue
@@ -217,20 +190,12 @@ def search_safe_intercept(src, target, ships, initial_by_id, ang_vel, comets, co
 
 
 def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, comet_ids):
-    # Iterate toward a self-consistent moving-target intercept, then fall back
-    # to a later safe window if needed.
     est = estimate_arrival(src.x, src.y, src.radius, target.x, target.y, target.radius, ships)
     if est is None:
         if not target_can_move(target, initial_by_id, comet_ids):
             return None
         return search_safe_intercept(
-            src,
-            target,
-            ships,
-            initial_by_id,
-            ang_vel,
-            comets,
-            comet_ids,
+            src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
         )
 
     tx, ty = target.x, target.y
@@ -245,13 +210,7 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
             if not target_can_move(target, initial_by_id, comet_ids):
                 return None
             return search_safe_intercept(
-                src,
-                target,
-                ships,
-                initial_by_id,
-                ang_vel,
-                comets,
-                comet_ids,
+                src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
             )
         if (
             abs(ntx - tx) < 0.3
@@ -265,12 +224,6 @@ def aim_with_prediction(src, target, ships, initial_by_id, ang_vel, comets, come
     final_est = estimate_arrival(src.x, src.y, src.radius, tx, ty, target.radius, ships)
     if final_est is None:
         return search_safe_intercept(
-            src,
-            target,
-            ships,
-            initial_by_id,
-            ang_vel,
-            comets,
-            comet_ids,
+            src, target, ships, initial_by_id, ang_vel, comets, comet_ids,
         )
     return final_est[0], final_est[1], tx, ty
