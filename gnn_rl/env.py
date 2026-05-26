@@ -95,32 +95,6 @@ class OrbitWarsPyGWrapper(BaseEnv):
             _player_id(self.current_raw_obs, self.agent_id),
         )
 
-
-def graph_action_to_move(
-    raw_obs: Any,
-    *,
-    source_idx: int,
-    target_idx: int,
-    ship_pct: float,
-) -> list[int | float] | None:
-    planets = _sorted_planets(raw_obs)
-    if source_idx < 0 or target_idx < 0:
-        return None
-    if source_idx >= len(planets) or target_idx >= len(planets) or source_idx == target_idx:
-        return None
-
-    source = planets[source_idx]
-    target = planets[target_idx]
-    available_ships = int(_planet_ships(source))
-    ship_count = int(available_ships * min(max(float(ship_pct), 0.0), 1.0))
-    ship_count = max(1, ship_count)
-    if ship_count <= 0:
-        return None
-
-    angle = math.atan2(_planet_y(target) - _planet_y(source), _planet_x(target) - _planet_x(source))
-    return [[_planet_id(source), float(angle), ship_count]]
-
-
 def _unpack_action(action: Any) -> tuple[int, int, float]:
     if isinstance(action, dict):
         return (

@@ -158,8 +158,8 @@ class GNNAgent(nn.Module):
         *,
         hidden_dim: int = 128,
         num_layers: int = 3,
-        num_ship_buckets: int = 10,
-        dropout: float = 0.1,
+        num_ship_buckets: int = 20,
+        dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -173,9 +173,9 @@ class GNNAgent(nn.Module):
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
+        # self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
 
-        self.source_head = make_mlp(hidden_dim * 2, hidden_dim, 1, num_layers=2, dropout=dropout)
+        self.source_head = make_mlp(hidden_dim * 2, hidden_dim, 1, num_layers=3, dropout=dropout)
         self.angle_head = make_mlp(hidden_dim * 2, hidden_dim, 2, num_layers=3, dropout=dropout)
         self.ship_head = make_mlp(hidden_dim * 2, hidden_dim, num_ship_buckets, num_layers=3, dropout=dropout)
         self.critic_head = make_mlp(hidden_dim, hidden_dim, 1, num_layers=2, dropout=dropout)
@@ -202,12 +202,13 @@ class GNNAgent(nn.Module):
             planet_ids=data.planet_ids
         )
 
-        if hx is None or cx is None:
-            hx = torch.zeros_like(graph_h)
-            cx = torch.zeros_like(graph_h)
+        # if hx is None or cx is None:
+        #     hx = torch.zeros_like(graph_h)
+        #     cx = torch.zeros_like(graph_h)
 
-        hx, cx = self.lstm(graph_h, (hx, cx))
-        graph_context = hx  # Dùng bộ nhớ làm bối cảnh toàn cục
+        # hx, cx = self.lstm(graph_h, (hx, cx))
+        # graph_context = hx  # Dùng bộ nhớ làm bối cảnh toàn cục
+        graph_context = graph_h
 
         batch_size = graph_context.size(0)
         dense_node_h, node_mask = to_dense_batch(node_h, batch)
@@ -277,7 +278,7 @@ def pointer_imitation_loss(
     output: GNNAgentOutput,
     data: Any,
     *,
-    num_ship_buckets: int = 10,
+    num_ship_buckets: int = 20,
     source_weight: float = 1.0,
     angle_weight: float = 1.0,
     ship_weight: float = 1.0,

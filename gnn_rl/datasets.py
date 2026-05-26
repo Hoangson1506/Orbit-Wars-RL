@@ -37,9 +37,6 @@ class GraphFeatureConfig:
     center_x: float = 50.0
     center_y: float = 50.0
     max_fleet_speed: float = 6.0
-    launch_clearance: float = 0.1
-    target_inference_horizon: int = 50
-    target_inference_timestep: float = 0.25
     top_k_edges: int = 10
 
 
@@ -154,7 +151,7 @@ class OrbitWarsGraphBuilder:
     """
 
     node_feature_dim = 21
-    edge_feature_dim = 18
+    edge_feature_dim = 15
     global_feature_dim = 21
 
     def __init__(self, config: GraphFeatureConfig | None = None) -> None:
@@ -431,18 +428,18 @@ class OrbitWarsGraphBuilder:
         src_id = src.id
         tgt_id = tgt.id
         # 1. TÍNH TOÁN THỜI GIAN ĐẾN NƠI (TTA - Time To Arrival)
-        aim = world.plan_shot(src_id, tgt_id, ships=1)
-        if aim is not None:
-            angle, turns, dist_to_target, _ = aim
-            turns_norm = turns / cfg.episode_steps
-            dist_norm = dist_to_target / cfg.board_size
-        else:
-            turns_norm = 1.0 
-            dist_norm = 1.0
+        # aim = world.plan_shot(src_id, tgt_id, ships=1)
+        # if aim is not None:
+        #     angle, turns, dist_to_target, _ = aim
+        #     turns_norm = turns / cfg.episode_steps
+        #     dist_norm = dist_to_target / cfg.board_size
+        # else:
+        #     turns_norm = 1.0 
+        #     dist_norm = 1.0
         
-        # 2. CHÊNH LỆCH TỐC ĐỘ PHẢN ỨNG (Mình bắn tới đó nhanh hơn hay địch nhanh hơn?)
-        my_t, enemy_t = world.reaction_times(tgt_id)
-        reaction_diff = (my_t - enemy_t) / cfg.episode_steps
+        # # 2. CHÊNH LỆCH TỐC ĐỘ PHẢN ỨNG (Mình bắn tới đó nhanh hơn hay địch nhanh hơn?)
+        # my_t, enemy_t = world.reaction_times(tgt_id)
+        # reaction_diff = (my_t - enemy_t) / cfg.episode_steps
 
         # 3. Traffic (fleet đang bay từ đâu đến đâu)
         traffic = traffic_map.get((src_id, tgt_id))
@@ -457,9 +454,9 @@ class OrbitWarsGraphBuilder:
             eta_val = 0.0
 
         return base + [
-            turns_norm,    # Số turn thực tế để bay tới
-            dist_norm,     # Khoảng cách va chạm thực tế (trừ đi bán kính đích)
-            reaction_diff, # Lợi thế chiến thuật về vị trí địa lý
+            # turns_norm,    # Số turn thực tế để bay tới
+            # dist_norm,     # Khoảng cách va chạm thực tế (trừ đi bán kính đích)
+            # reaction_diff, # Lợi thế chiến thuật về vị trí địa lý
             ally_flying,  # Quân ta đang bay từ src -> tgt
             enemy_flying, # Quân địch đang bay từ src -> tgt
             eta_val       # Mức độ khẩn cấp (Hạm đội đầu tiên bao giờ tới?)

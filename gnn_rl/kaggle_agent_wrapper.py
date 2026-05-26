@@ -1,7 +1,5 @@
 import torch
-from datasets import _player_id, _sorted_planets, _fleets, _planet_id, _planet_owner, _planet_ships, Data, OrbitWarsGraphBuilder
-from env import graph_action_to_move
-
+from datasets import OrbitWarsGraphBuilder, _obs_get, Planet
 # Import your trained model architecture
 from models import GNNAgent
 
@@ -16,13 +14,13 @@ class KaggleGNNWrapper:
         
         # Initialize the model architecture (ensure dims match your training setup)
         self.model = GNNAgent(
-            node_dim=12,
-            edge_dim=13,
-            global_dim=12,
+            node_dim=21,     
+            edge_dim=18,     
+            global_dim=21,   
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout,
-        ).to(device)
+        ).to(self.device)
         
         # Load the IL trained weights
         checkpoint = torch.load(
@@ -38,32 +36,75 @@ class KaggleGNNWrapper:
         """
         The method called by Kaggle Environments at every step.
         """
-        # 1. Convert raw Kaggle obs to PyTorch Geometric graph
-        data = self.graph_builder.obs_to_data(obs, _player_id(obs)).to(self.device)
-
-        print(data.source_mask.sum())
-
-        # 2. Get model prediction (deterministic=True is standard for evaluation)
-        with torch.no_grad():
-            output = self.model.act(data, deterministic=True)
+        player_id = _obs_get(obs, "player", 0)
+        actions = []
         
-        # 3. Extract predictions
-        source_idx = output["source"].item()
-        target_idx = output["target"].item()
-        ship_pct = output["ship_pct"].item()
+        # Khởi tạo các trạng thái "bóng" (Shadow States) cho lượt này
+        simulated_fleets = []
+        deductions = {}
+        
+        # Khởi tạo bộ nhớ LSTM (Trống vào đầu mỗi Turn mới)
+        hx, cx = None, None
+        
+        # Mapping để dễ dàng tra cứu lượng quân gốc
+        planets_raw = _obs_get(obs, "planets", [])
+        planets = [Planet(*planet_raw) for planet_raw in planets_raw]
+        base_ships_map = {p.id: p.ships for p in planets}
 
-        # 4. Format output to Kaggle's expected action format
-        # TODO: Adjust this depending on how Orbit Wars expects the action string/dict.
-        # Example: "source_planet_id-target_planet_id-ship_amount"
-        
-        # You will likely need to map your graph node indices back to actual planet IDs
-        # and convert ship_pct to an absolute integer based on the source planet's garrison.
-        action = graph_action_to_move(
-            obs,
-            source_idx=source_idx,
-            target_idx=target_idx,
-            ship_pct=ship_pct,
-        )
-        print(action)
-        
-        return action
+        # Giới hạn số hành động mỗi lượt để chống infinite loop (Safe-guard)
+        MAX_ACTIONS_PER_TURN = 10 
+
+        for _ in range(MAX_ACTIONS_PER_TURN):
+            # 1. Trích xuất đồ thị VỚI các hành động nháp đã thực hiện
+            data = self.graph_builder.obs_to_data(
+                obs, 
+                player_id, 
+                deductions=deductions, 
+                simulated_fleets=simulated_fleets
+            ).to(self.device)
+
+            # 2. Dự đoán hành động tiếp theo
+            with torch.no_grad():
+                output = self.model.act(data, hx=hx, cx=cx, deterministic=True)
+            
+            # Cập nhật bộ nhớ cho vòng lặp tiếp theo
+            hx, cx = output["hx"], output["cx"]
+            
+            # 3. Trích xuất kết quả
+            source_idx = output["source"].item()
+            planet_id = data.planet_ids[source_idx].item()
+
+            # 4. KIỂM TRA ĐIỀU KIỆN DỪNG (END TURN)
+            # Dummy node luôn được gán ID là -1 trong GraphBuilder
+            if planet_id == -1:
+                break  # Mô hình quyết định dừng xuất quân
+
+            angle = output["angle"].item()
+            ship_pct = output["ship_pct"].item()
+
+            # 5. Tính toán số quân xuất kích
+            # Lấy số quân GỐC trừ đi số quân đã sử dụng ở các bước trước trong cùng turn
+            base_ships = float(base_ships_map.get(planet_id, 0.0))
+            available_ships = max(0.0, base_ships - deductions.get(planet_id, 0.0))
+            
+            # Tính lượng quân thực tế và làm tròn
+            ship_count = int(available_ships * min(max(ship_pct, 0.0), 1.0))
+            ship_count = max(1, ship_count) # Kaggle yêu cầu gửi ít nhất 1 quân
+            
+            # Nếu vì lý do gì đó lượng quân tính ra <= 0 (thường là do làm tròn), bỏ qua hành động này
+            if ship_count <= 0 or available_ships <= 0:
+                continue
+
+            # 6. Ghi nhận hành động chuẩn của Kaggle
+            actions.append([planet_id, float(angle), ship_count])
+
+            # 7. Cập nhật Shadow States để model nhìn thấy cục diện ở vòng lặp sau
+            deductions[planet_id] = deductions.get(planet_id, 0.0) + ship_count
+            simulated_fleets.append({
+                "from_planet_id": planet_id,
+                "angle": angle,
+                "ships": ship_count,
+                "owner": player_id
+            })
+
+        return actions

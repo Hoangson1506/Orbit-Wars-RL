@@ -14,7 +14,7 @@ import torch
 
 try:
     from torch_geometric.loader import DataLoader
-except ImportError as exc:  # pragma: no cover - exercised only when PyG is missing.
+except ImportError as exc:  
     DataLoader = None
     _PYG_IMPORT_ERROR = exc
 else:
@@ -34,11 +34,13 @@ else:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Orbit Wars GNN pointer policy by imitation learning.")
     parser.add_argument("replays", nargs="*", help="Replay JSON files or directories. Defaults to gnn_rl/replays.")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=640)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--top-k-edges", type=int, default=12)
+    parser.add_argument("--num_ship_buckets", type=int, default=20)
+    parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
@@ -90,6 +92,7 @@ def main() -> None:
         global_dim=sample.global_attr.size(-1),
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        num_ship_buckets=args.num_ship_buckets,
         dropout=args.dropout,
     ).to(device)
 
@@ -137,6 +140,7 @@ def main() -> None:
                 model, train_loader, device, optimizer=optimizer,
                 source_weight=args.source_weight, angle_weight=args.angle_weight,
                 ship_weight=args.ship_weight, max_grad_norm=args.max_grad_norm,
+                num_ship_buckets=args.num_ship_buckets
             )
 
             t_loss = train_stats["loss"].item() if isinstance(train_stats["loss"], torch.Tensor) else train_stats["loss"]
@@ -149,6 +153,7 @@ def main() -> None:
                     model, val_loader, device, optimizer=None,
                     source_weight=args.source_weight, angle_weight=args.angle_weight,
                     ship_weight=args.ship_weight, max_grad_norm=args.max_grad_norm,
+                    num_ship_buckets=args.num_ship_buckets
                 )
                 v_loss = val_stats["loss"].item() if isinstance(val_stats["loss"], torch.Tensor) else val_stats["loss"]
                 epoch_val_losses.append(v_loss)
@@ -173,7 +178,7 @@ def main() -> None:
 
 def run_epoch(
     model: GNNAgent,
-    loader: DataLoader,
+    loader,
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None,
@@ -181,6 +186,7 @@ def run_epoch(
     angle_weight: float,
     ship_weight: float,
     max_grad_norm: float,
+    num_ship_buckets: int = 20,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -201,6 +207,7 @@ def run_epoch(
             loss, parts = pointer_imitation_loss(
                 output,
                 batch,
+                num_ship_buckets=num_ship_buckets,
                 source_weight=source_weight,
                 angle_weight=angle_weight,
                 ship_weight=ship_weight,
@@ -212,7 +219,13 @@ def run_epoch(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
 
-        pbar.set_postfix(loss=float(loss.item()))
+        pbar.set_postfix(loss=float(loss.item()), 
+                         source_loss=float(parts["source_loss"].item()), 
+                         angle_loss=float(parts["angle_loss"].item()), 
+                         ship_loss=parts["ship_loss"].item(), 
+                         angle_error=parts["angle_error"].item(), 
+                         ship_error=parts["ship_error"].item()
+                         )
 
         for key, value in parts.items():
             totals[key] += float(value.item()) * batch_count
