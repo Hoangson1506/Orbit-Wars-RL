@@ -3,7 +3,6 @@ from .datasets import (
     GraphFeatureConfig,
     OrbitWarsGraphBuilder,
     OrbitWarsReplayDataset,
-    replay_to_dataframe,
 )
 from .models import GNNAgent, GNNAgentOutput, pointer_imitation_loss
 
@@ -15,5 +14,4 @@ __all__ = [
     "OrbitWarsGraphBuilder",
     "OrbitWarsReplayDataset",
     "pointer_imitation_loss",
-    "replay_to_dataframe",
 ]

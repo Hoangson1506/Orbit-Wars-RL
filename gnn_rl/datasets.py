@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 from collections import namedtuple
+import random
 
 import numpy as np
 import pandas as pd
@@ -22,13 +23,15 @@ else:
 
 
 IGNORE_INDEX = -100
+MAX_PLANETS = 60
+SAMPLE_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
 class GraphFeatureConfig:
     board_size: float = 100.0
     episode_steps: int = 500
-    max_planets: int = 48
+    max_planets: int = MAX_PLANETS
     max_ships: float = 500.0
     max_production: float = 5.0
     max_radius: float = 5.0
@@ -39,6 +42,11 @@ class GraphFeatureConfig:
     max_fleet_speed: float = 6.0
     top_k_edges: int = 10
 
+    # Target infer
+    launch_clearance: float = 0.1
+    target_inference_timestep: float = 0.25
+    inference_horizon: float = 50
+
 
 def _require_pyg() -> None:
     if Data is None:
@@ -48,91 +56,113 @@ def _require_pyg() -> None:
         ) from _PYG_IMPORT_ERROR
 
 
-def replay_to_dataframe(json_path: str | Path, action_observation_offset: int = -1) -> pd.DataFrame:
-    """
-    Parses a single episode JSON and returns a Pandas DataFrame,
-    preserving the raw observation dict for downstream feature preparation.
-
-    Kaggle replay rows store the action on the row after the observation that
-    produced it. The default offset therefore pairs an action with the previous
-    observation for the same agent, which is the state the policy actually saw.
-    """
+def replay_to_filtered_dataframe(
+    json_path: str | Path, 
+    target_player_name: str, 
+    keep_empty_turn_ratio: float = 0.2,
+    action_observation_offset: int = -1
+):
     with open(json_path, "r", encoding="utf-8") as f:
         replay = json.load(f)
 
+    # =================================================================
+    # BƯỚC 1: TÌM AGENT_ID CỦA NGƯỜI CHƠI MỤC TIÊU
+    # =================================================================
+    team_names = replay.get("info", {}).get("TeamNames", [])
+    if target_player_name not in team_names:
+        return pd.DataFrame()  # Người chơi này không có trong ván đấu
+    
+    target_agent_id = team_names.index(target_player_name)
+
     steps = replay.get("steps", [])
+    if not steps:
+        return pd.DataFrame()
+
+    # =================================================================
+    # BƯỚC 2: KIỂM TRA ĐIỀU KIỆN CHIẾN THẮNG (CHỈ HỌC TỪ WINNER)
+    # =================================================================
+    rewards = replay.get("rewards", [])
+    
+    if not rewards or len(rewards) <= target_agent_id:
+        return pd.DataFrame()  
+    
+    valid_rewards = [r for r in rewards if r is not None]
+
+    if not valid_rewards or rewards[target_agent_id] is None:
+        return pd.DataFrame()
+
+    target_reward = rewards[target_agent_id]
+    if target_reward < max(valid_rewards):
+        return pd.DataFrame()  # Không phải người cao điểm nhất -> Bỏ qua
+
+    # =================================================================
+    # BƯỚC 3: TRÍCH XUẤT HÀNH ĐỘNG CHO MULTI-LABEL
+    # =================================================================
     data_rows: list[dict[str, Any]] = []
+    
     for step_idx, step in enumerate(steps):
-        for agent_id, agent_data in enumerate(step):
-            obs_step_idx = step_idx + action_observation_offset
-            if obs_step_idx < 0 or obs_step_idx >= len(steps):
-                continue
-            if agent_id >= len(steps[obs_step_idx]):
-                continue
+        agent_id = target_agent_id
+        if agent_id >= len(step):
+            continue
+            
+        agent_data = step[agent_id]
 
-            obs = steps[obs_step_idx][agent_id].get("observation", {})
-            if not obs:
-                continue
+        obs_step_idx = step_idx + action_observation_offset
+        if obs_step_idx < 0 or obs_step_idx >= len(steps):
+            continue
+        if agent_id >= len(steps[obs_step_idx]):
+            continue
 
-            player_id = obs.get("player", agent_id)
-            action = agent_data.get("action", [])
+        obs = steps[obs_step_idx][agent_id].get("observation", {})
+        if not obs:
+            continue
 
-            deductions = {}
-            simulated_fleets = []
+        player_id = obs.get("player", agent_id)
+        action = agent_data.get("action", [])
 
-            if not action:
-                # Nếu turn này Expert không làm gì cả -> Thêm row "End Turn"
+        # =================================================================
+        # BƯỚC 4: XỬ LÝ EMPTY TURNS & GỘP ACTIONS
+        # =================================================================
+        if not action:
+            # Turn này Expert KHÔNG có hành động nào
+            if random.random() <= keep_empty_turn_ratio:
                 data_rows.append({
                     "step": step_idx,
                     "obs_step": obs_step_idx,
                     "player_id": player_id,
-                    "action_source": -1,       # -1 đại diện cho End Turn Dummy Node
-                    "action_angle": 0.0,
-                    "action_ships": 0.0,
-                    "ship_deductions": {},     # Chưa trừ quân nào
-                    "simulated_fleets": [],  # Simulate hành động bắn
+                    # Multi-label: Trả về list rỗng thay vì node -1
+                    "action_sources": [], 
+                    "action_angles": [],
+                    "action_ships": [],
                     "raw_obs": obs,
                 })
+            continue # Kết thúc xử lý step này
+
+        # Nếu có action, gộp tất cả vào các danh sách (Lists)
+        sources = []
+        angles = []
+        ships = []
+
+        for single_act in action:
+            if len(single_act) != 3:
                 continue
 
-            for single_act in action:
-                if len(single_act) != 3:
-                    continue
+            from_planet_id, angle, num_ships = single_act
 
-                from_planet_id, angle, num_ships = single_act
+            sources.append(from_planet_id)
+            angles.append(angle)
+            ships.append(num_ships)
 
-                data_rows.append({
-                        "step": step_idx,
-                        "obs_step": obs_step_idx,
-                        "player_id": player_id,
-                        "action_source": from_planet_id,
-                        "action_angle": angle,
-                        "action_ships": num_ships,
-                        "ship_deductions": dict(deductions), # Copy deductions TẠI THỜI ĐIỂM NÀY
-                        "simulated_fleets": list(simulated_fleets),
-                        "raw_obs": obs,
-                    })
-                
-                deductions[str(int(from_planet_id))] = deductions.get(from_planet_id, 0) + num_ships
-                simulated_fleets.append({
-                    "from_planet_id": from_planet_id,
-                    "angle": angle,
-                    "ships": num_ships,
-                    "owner": player_id
-                })
-
-            if action:
-                data_rows.append({
-                        "step": step_idx,
-                        "obs_step": obs_step_idx,
-                        "player_id": player_id,
-                        "action_source": -1,
-                        "action_angle": 0.0,
-                        "action_ships": 0.0,
-                        "ship_deductions": dict(deductions), # Gửi kèm tổng deductions
-                        "simulated_fleets": list(simulated_fleets),
-                        "raw_obs": obs,
-                    })
+        # Lưu 1 turn thành ĐÚNG 1 DÒNG DUY NHẤT
+        data_rows.append({
+            "step": step_idx,
+            "obs_step": obs_step_idx,
+            "player_id": player_id,
+            "action_sources": sources, # List các hành tinh xuất quân
+            "action_angles": angles,   # List các góc tương ứng
+            "action_ships": ships,     # List số lượng quân tương ứng
+            "raw_obs": obs,
+        })
 
     return pd.DataFrame(data_rows)
 
@@ -156,10 +186,13 @@ class OrbitWarsGraphBuilder:
 
     def __init__(self, config: GraphFeatureConfig | None = None) -> None:
         self.config = config or GraphFeatureConfig()
+        self.world_model = None
 
-    def obs_to_data(self, raw_obs: Any, player_id: int | None = None, deductions: dict = None, simulated_fleets: list[dict] = None) -> Any:
+    def obs_to_data(self, raw_obs: Any, player_id: int | None = None) -> Any:
         _require_pyg()
-        player_id = _obs_get(raw_obs, "player", 0)
+        if player_id is None:
+            player_id = _obs_get(raw_obs, "player", 0)
+        player_id = int(player_id)
         raw_planets = _obs_get(raw_obs, "planets", [])
         raw_fleets = _obs_get(raw_obs, "fleets", [])
         step = _obs_get(raw_obs, "step", 0)
@@ -178,39 +211,6 @@ class OrbitWarsGraphBuilder:
         initial_planets = [Planet(*planet) for planet in raw_init]
         initial_by_id = {planet.id: planet for planet in initial_planets}
 
-        # Trừ quân trên hành tinh có hành động để giả lập thực hiện hành động (Do observation là trước khi thực hiện hành động)
-        if deductions is not None and len(deductions) > 0:
-            for p in planets:
-                if p.id in deductions:
-                    p.ships = max(0.0, float(p.ships) - deductions[p.id])
-
-        # Giả lập hạm đội bay từ hành tinh thực hiện hành động
-        if simulated_fleets is not None and len(simulated_fleets) > 0:
-            planet_by_id = {p.id: p for p in planets}
-            
-            for sim_fl in simulated_fleets:
-                src_planet = planet_by_id.get(sim_fl["from_planet_id"])
-                if src_planet:
-                    ang = sim_fl["angle"]
-                    
-                    # Epsilon trick: Dịch hạm đội ra xa tâm hành tinh một chút 
-                    # để WorldModel không nghĩ là hạm đội đang đâm vào nhà chính.
-                    eps = 1e-4
-                    fx = src_planet.x + math.cos(ang) * eps
-                    fy = src_planet.y + math.sin(ang) * eps
-                    
-                    mock_fleet = Fleet(
-                        id=-1,
-                        owner=sim_fl["owner"],
-                        ships=sim_fl["ships"],
-                        angle=ang,
-                        x=fx,
-                        y=fy,
-                        from_planet_id=sim_fl["from_planet_id"]
-                    )
-                    fleets.append(mock_fleet)
-
-
         world = WorldModel(
             player=player_id,
             step=step,
@@ -221,6 +221,7 @@ class OrbitWarsGraphBuilder:
             comets=comets,
             comet_ids=comet_ids,
         )
+        self.world_model = world
 
         # Traffic Map cho heuristic features về fleets
         traffic_map = defaultdict(lambda: {
@@ -268,22 +269,6 @@ class OrbitWarsGraphBuilder:
         )
         planet_ids = torch.tensor([planet.id for planet in planets], dtype=torch.long)
 
-        # --- BẮT ĐẦU PHẦN THÊM DUMMY NODE (END TURN) ---
-        # 1. Thêm 1 node chứa toàn số 0 vào x
-        dummy_x = torch.zeros((1, self.node_feature_dim), dtype=torch.float32)
-        x = torch.cat([x, dummy_x], dim=0)
-
-        # 2. Cập nhật các mask để cho phép mô hình được quyền chọn Dummy Node
-        dummy_owner = torch.tensor([True], dtype=torch.bool)
-        owner_mask = torch.cat([owner_mask, dummy_owner], dim=0)
-
-        dummy_source_mask = torch.tensor([True], dtype=torch.bool) # Lúc nào cũng có quyền dừng!
-        source_mask = torch.cat([source_mask, dummy_source_mask], dim=0)
-
-        dummy_id = torch.tensor([-1], dtype=torch.long)
-        planet_ids = torch.cat([planet_ids, dummy_id], dim=0)
-        # --- KẾT THÚC PHẦN THÊM DUMMY NODE ---
-
         return Data(
             x=x,
             edge_index=edge_index,
@@ -292,7 +277,7 @@ class OrbitWarsGraphBuilder:
             owner_mask=owner_mask,
             source_mask=source_mask,
             planet_ids=planet_ids,
-            num_nodes=len(planets) + 1,
+            num_nodes=len(planets),
         )
 
     def _node_features(self, planet: Planet, player_id: int, world: WorldModel) -> list[float]:
@@ -528,25 +513,17 @@ class OrbitWarsGraphBuilder:
     
 
 class OrbitWarsReplayDataset(Dataset):
-    """
-    Imitation-learning dataset for pointer-policy GNNs.
-
-    Each sample is a PyG Data object with graph tensors and labels:
-      y_source: local node index of the launching planet
-      y_angle: angle that the data produce
-      y_ship_pct: action_ships divided by source ships in the policy observation
-    """
-
     def __init__(
         self,
         replay_paths: str | Path | Iterable[str | Path] | None = None,
         dataframe: pd.DataFrame | None = None,
         *,
         cache_path: str | Path | None = None,
-        graph_builder: OrbitWarsGraphBuilder | None = None,
+        graph_builder: Any | None = None,
         action_observation_offset: int = -1,
         assume_post_action_obs: bool = False,
         skip_invalid: bool = True,
+        max_planets: int = MAX_PLANETS, 
     ) -> None:
         if dataframe is None:
             paths = _normalise_paths(replay_paths)
@@ -554,27 +531,45 @@ class OrbitWarsReplayDataset(Dataset):
                 raise ValueError("Provide replay_paths or dataframe.")
             dataframe = pd.concat(
                 [
-                    replay_to_dataframe(path, action_observation_offset=action_observation_offset)
+                    # Giả định bạn dùng hàm replay_to_dataframe cũ ở đây
+                    replay_to_filtered_dataframe(path, target_player_name='flg', action_observation_offset=action_observation_offset)
                     for path in paths
                 ],
                 ignore_index=True,
             )
         self.df = dataframe.reset_index(drop=True)
-        self.graph_builder = graph_builder or OrbitWarsGraphBuilder()
+        self.graph_builder = graph_builder or OrbitWarsGraphBuilder() # Tạo graph_builder mặc định bên ngoài nếu None
         self.assume_post_action_obs = assume_post_action_obs
         self.skip_invalid = skip_invalid
+        self.max_planets = max_planets
+        self.no_action_idx = max_planets
 
         # Optimized data access (cache)
+        self.samples = None
         if cache_path is not None and Path(cache_path).exists():
             print("Loading sample cache")
-            self.samples = torch.load(cache_path)
+            try:
+                cached = torch.load(cache_path, weights_only=False)
+            except TypeError:
+                cached = torch.load(cache_path)
 
-        else:
+            if (
+                isinstance(cached, dict)
+                and cached.get("version") == SAMPLE_CACHE_VERSION
+                and "samples" in cached
+            ):
+                self.samples = cached["samples"]
+            else:
+                print("Ignoring stale sample cache")
+
+        if self.samples is None:
             print("Preparing samples")
             self.samples = self._prepare_samples(self.df)
-
             if cache_path is not None:
-                torch.save(self.samples, cache_path)
+                torch.save(
+                    {"version": SAMPLE_CACHE_VERSION, "samples": self.samples},
+                    cache_path,
+                )
 
         self.records = list(self.df.itertuples(index=False))
 
@@ -582,24 +577,32 @@ class OrbitWarsReplayDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        row_idx, labels = self.samples[idx]
+        row_idx, labels_list = self.samples[idx]
 
         row = self.records[row_idx]
-
         raw_obs = row.raw_obs
         player_id = int(row.player_id)
-        sim_fleets = row.simulated_fleets if hasattr(row, 'simulated_fleets') else []
-        deductions = row.ship_deductions if hasattr(row, 'ship_deductions') else {}
 
-        data = self.graph_builder.obs_to_data(raw_obs, player_id, deductions=deductions, simulated_fleets=sim_fleets)
+        # Chuyển raw_obs thành PyG Data
+        data = self.graph_builder.obs_to_data(raw_obs, player_id)
+        num_nodes = len(data.planet_ids)
 
-        data.y_source = torch.tensor([labels["source_idx"]], dtype=torch.long)
-        data.y_angle = torch.tensor([[labels["angle_sin"], labels["angle_cos"]]], dtype=torch.float32)
-        data.y_ship_pct = torch.tensor([labels["ship_pct"]], dtype=torch.float32)
+        # =================================================================
+        # KHỞI TẠO TENSOR LABEL MỚI
+        # y_target: Mặc định mọi node đều là NO_ACTION_IDX
+        # y_ship_pct: Mặc định là 0.0
+        # =================================================================
+        y_target = torch.full((num_nodes,), self.no_action_idx, dtype=torch.long)
+        y_ship_pct = torch.zeros(num_nodes, dtype=torch.float32)
 
-        data.action_source_id = torch.tensor([labels["source_id"]], dtype=torch.long)
-        data.action_angle = torch.tensor([labels["raw_angle"]], dtype=torch.long)
-        data.action_ships = torch.tensor([row.action_ships], dtype=torch.float32)
+        for act in labels_list:
+            s_idx = act["source_idx"]
+            if s_idx < num_nodes: # Đề phòng lỗi out-of-bound
+                y_target[s_idx] = act["target_idx"]
+                y_ship_pct[s_idx] = act["ship_pct"]
+
+        data.y_target = y_target
+        data.y_ship_pct = y_ship_pct
 
         return data
 
@@ -611,73 +614,245 @@ class OrbitWarsReplayDataset(Dataset):
             if i % 10000 == 0:
                 print(f"processed {i}/{n}")
 
-            labels = self._labels_for_row(row)
+            labels_list = self._labels_for_row(row)
 
-            if labels is None:
+            if labels_list is None:
                 if self.skip_invalid:
                     continue
+                labels_list = []
 
-                labels = {
-                    "source_idx": IGNORE_INDEX,
-                    "source_id": -1,
-                    "angle_sin": 0.0,
-                    "angle_cos": 1.0,
-                    "raw_angle": 0.0,
-                    "ship_pct": 0.0,
-                }
+            if len(labels_list) == 0:
+                if random.random() > 0.05:
+                    continue
 
-            samples.append((i, labels))
+            samples.append((i, labels_list))
 
         return samples
 
-    def _labels_for_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+    def _labels_for_row(self, row: dict[str, Any]) -> list[dict[str, Any]] | None:
         raw_obs = row.raw_obs
         raw_planets = _obs_get(raw_obs, "planets", [])
+        
         planets = [Planet(*planet) for planet in raw_planets]
         id_to_idx = {planet.id: idx for idx, planet in enumerate(planets)}
+        
         if not planets:
             return None
-
-        if pd.isna(row.action_source):
-            return None
         
-        source_id = int(row.action_source)
-        if source_id == -1:
-            return {
-                "source_id": -1,
-                "source_idx": len(planets), # Trỏ tới Dummy Node (nằm ở cuối list Node)
-                "angle_sin": 0.0,
-                "angle_cos": 1.0,
-                "raw_angle": 0.0,
-                "ship_pct": 0.0,
-            }
-        if source_id not in id_to_idx:
+        sources = getattr(row, "action_sources", [])
+        angles = getattr(row, "action_angles", [])
+        ships = getattr(row, "action_ships", [])
+
+        if isinstance(sources, float) and math.isnan(sources):
+            sources, angles, ships = [], [], []
+
+        valid_actions = []
+        missing_action_source = False
+
+        for src_id, action_angle, action_ships in zip(sources, angles, ships):
+            src_id = int(src_id)
+            if src_id not in id_to_idx:
+                missing_action_source = True
+                continue
+
+            source_idx = id_to_idx[src_id]
+            source_planet = planets[source_idx]
+            
+            # --- 1. TÍNH TỶ LỆ TÀU (SHIP PCT) ---
+            observed_ships = float(source_planet.ships)
+            available_ships = max(observed_ships, 1.0)
+            ship_pct = float(np.clip(float(action_ships) / available_ships, 0.0, 1.0))
+
+            # --- 2. DỊCH GÓC BAY SANG INDEX MỤC TIÊU ---
+            best_target_idx = infer_target_index_from_angle(
+                                    raw_obs=raw_obs,
+                                    planets=planets, # Dùng luôn list planets đang duyệt
+                                    source_idx=source_idx,
+                                    action_angle=float(action_angle),
+                                    action_ships=float(action_ships)
+                                )
+
+            target_idx = best_target_idx if best_target_idx is not None and best_target_idx >= 0 else IGNORE_INDEX
+            valid_actions.append({
+                "source_idx": source_idx,
+                "target_idx": target_idx,
+                "ship_pct": ship_pct,
+            })
+
+        if missing_action_source:
             return None
 
-        source_idx = id_to_idx[source_id]
-        source_planet = planets[source_idx]
-        action_angle = float(row.action_angle)
-        action_ships = float(row.action_ships)
+        return valid_actions
 
-        prior_deductions = row.ship_deductions.get(source_id, 0.0)
-        observed_ships = float(source_planet.ships)
-        actual_ships_remaining = max(0.0, observed_ships - prior_deductions)
-        available_ships = actual_ships_remaining + action_ships if self.assume_post_action_obs else actual_ships_remaining
-        available_ships = max(available_ships, 1.0)
-        ship_pct = float(np.clip(action_ships / available_ships, 0.0, 1.0))
 
-        angle_sin = math.sin(action_angle)
-        angle_cos = math.cos(action_angle)
+def infer_target_index_from_angle(
+    raw_obs: Any,
+    planets: list[Any], # Truyền thẳng list planets đã parse vào
+    source_idx: int,
+    action_angle: float,
+    action_ships: float,
+    cfg: Any = None,
+) -> int:
+    """
+    Suy luận Node Index của mục tiêu bằng cách mô phỏng quỹ đạo bay.
+    """
+    if source_idx < 0 or source_idx >= len(planets) or len(planets) <= 1:
+        return IGNORE_INDEX
 
-        return {
-            "source_id": source_id,
-            "source_idx": source_idx,
-            "angle_sin": angle_sin,
-            "angle_cos": angle_cos,
-            "raw_angle": action_angle,
-            "ship_pct": ship_pct,
-        }
+    source = planets[source_idx]
+    ships = float(action_ships)
+    cfg = cfg or GraphFeatureConfig()
+    
+    if not math.isfinite(action_angle) or not math.isfinite(ships) or ships <= 0.0:
+        return IGNORE_INDEX
 
+    speed = get_fleet_speed(ships, cfg)
+    dir_x = math.cos(action_angle)
+    dir_y = math.sin(action_angle)
+    
+    # Tính tọa độ xuất phát (Viền hành tinh + Khoảng cách an toàn)
+    start_x = source.x + dir_x * (source.radius + cfg.launch_clearance)
+    start_y = source.y + dir_y * (source.radius + cfg.launch_clearance)
+
+    # Đọc các thông số môi trường
+    angular_velocity = float(_obs_get(raw_obs, "angular_velocity", 0.0))
+    comet_ids = {int(p_id) for p_id in _obs_get(raw_obs, "comet_planet_ids", [])}
+    
+    horizon = cfg.inference_horizon
+    timestep = max(0.05, min(1.0, float(cfg.target_inference_timestep)))
+
+    # Kiểm tra xem có bay đâm thẳng vào mặt trời không
+    sun_hit_dist = ray_circle_entry_distance(
+        start_x, start_y, dir_x, dir_y, cfg.center_x, cfg.center_y, cfg.sun_radius
+    )
+    sun_hit_time = sun_hit_dist / speed if sun_hit_dist is not None else float('inf')
+
+    elapsed = 0.0
+    while elapsed < horizon:
+        next_elapsed = min(horizon, elapsed + timestep)
+        
+        segment_start = (
+            start_x + dir_x * speed * elapsed,
+            start_y + dir_y * speed * elapsed,
+        )
+        segment_end = (
+            start_x + dir_x * speed * next_elapsed,
+            start_y + dir_y * speed * next_elapsed,
+        )
+
+        step_best: tuple[float, float, int] | None = None
+        
+        # Duyệt qua các hành tinh để xem có đâm trúng ai trong khoảng delta_t này không
+        for idx, planet in enumerate(planets):
+            if idx == source_idx:
+                continue
+
+            is_comet = planet.id in comet_ids
+            future_position = predict_planet_position(
+                planet, next_elapsed, cfg, angular_velocity, is_comet
+            )
+
+            hit_fraction = segment_circle_entry_fraction(
+                segment_start, segment_end, 
+                future_position[0], future_position[1], planet.radius
+            )
+            
+            if hit_fraction is not None:
+                hit_time = elapsed + (next_elapsed - elapsed) * hit_fraction
+                hit_distance = speed * hit_time
+                score = (hit_time, hit_distance, idx)
+                
+                # Cập nhật mục tiêu chạm đầu tiên
+                if step_best is None or score < step_best:
+                    step_best = score
+
+        if step_best is not None:
+            hit_time, _, target_idx = step_best
+            
+            # Nếu đâm mặt trời TRƯỚC KHI đâm hành tinh -> Hỏng, bỏ qua lệnh này
+            if sun_hit_time <= hit_time + 1e-9:
+                return IGNORE_INDEX
+            return target_idx
+
+        # Nếu chưa đâm hành tinh, nhưng lại đâm mặt trời trong step này -> Hỏng
+        if sun_hit_time <= next_elapsed + 1e-9:
+            return IGNORE_INDEX
+
+        elapsed = next_elapsed
+
+    # Bay hết horizon mà không trúng gì -> Bay ra ngoài vũ trụ
+    return IGNORE_INDEX
+
+def get_fleet_speed(ships: float, cfg: Any) -> float:
+    return fleet_speed(ships)
+
+def ray_circle_entry_distance(
+    ox: float, oy: float, dx: float, dy: float, cx: float, cy: float, r: float
+) -> float | None:
+    """Tìm khoảng cách từ điểm xuất phát (ox, oy) đến khi chạm vào hình tròn (mặt trời)."""
+    # Vector từ tâm mặt trời đến điểm xuất phát
+    vx, vy = ox - cx, oy - cy
+    
+    b = 2.0 * (vx * dx + vy * dy)
+    c = (vx**2 + vy**2) - r**2
+    
+    delta = b**2 - 4 * c
+    if delta < 0:
+        return None # Không chạm
+        
+    t1 = (-b - math.sqrt(delta)) / 2.0
+    t2 = (-b + math.sqrt(delta)) / 2.0
+    
+    # Lấy điểm chạm đầu tiên ở phía trước (t > 0)
+    if t1 > 0: return t1
+    if t2 > 0: return t2
+    return None
+
+def segment_circle_entry_fraction(
+    start: tuple[float, float], end: tuple[float, float], cx: float, cy: float, r: float
+) -> float | None:
+    """Kiểm tra đoạn thẳng (bước nhảy thời gian) có cắt hình tròn (hành tinh) không."""
+    sx, sy = start
+    ex, ey = end
+    
+    # Vector đoạn thẳng
+    seg_dx, seg_dy = ex - sx, ey - sy
+    length = math.hypot(seg_dx, seg_dy)
+    if length == 0: return None
+    
+    # Chuẩn hóa vector hướng
+    dx, dy = seg_dx / length, seg_dy / length
+    
+    dist = ray_circle_entry_distance(sx, sy, dx, dy, cx, cy, r)
+    
+    # Nếu chạm và điểm chạm nằm TRONG ĐOẠN THẲNG (t <= length)
+    if dist is not None and dist <= length:
+        return dist / length
+    return None
+
+def predict_planet_position(
+    planet: Any, elapsed: float, cfg: Any, angular_velocity: float, is_comet: bool
+) -> tuple[float, float]:
+    """Dự đoán vị trí của hành tinh sau `elapsed` turns."""
+    if is_comet:
+        # Thiên thạch thường bay thẳng hoặc theo rule riêng của game (Giả định đứng im nếu không rõ logic)
+        # Nếu bạn có logic của comet, hãy bổ sung vào đây. Tạm thời trả về vị trí cũ.
+        return (planet.x, planet.y)
+    
+    # Hành tinh quay quanh tâm
+    cx, cy = cfg.center_x, cfg.center_y
+    dx, dy = planet.x - cx, planet.y - cy
+    radius = math.hypot(dx, dy)
+    if radius + planet.radius >= cfg.rotation_radius_limit:
+        return (planet.x, planet.y)
+
+    current_angle = math.atan2(dy, dx)
+    
+    new_angle = current_angle + angular_velocity * elapsed
+    
+    new_x = cx + radius * math.cos(new_angle)
+    new_y = cy + radius * math.sin(new_angle)
+    return (new_x, new_y)
 
 def _normalise_paths(paths: str | Path | Iterable[str | Path] | None) -> list[Path]:
     if paths is None:

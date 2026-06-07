@@ -220,7 +220,12 @@ __marimo__/
 # checkpoint
 orbit_wars_checkpoint/
 artifacts/
+models/
+runs/
+output_logs/
 
 # Data
 *chunks*/
+*chunk*/
+archive/
 replays

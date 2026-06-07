@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import random
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.distributions import VonMises
+
+MAX_PLANETS = 60
 
 try:
     from torch_geometric.nn import GINEConv, GATv2Conv, global_mean_pool
@@ -24,17 +27,15 @@ IGNORE_INDEX = -100
 NEG_INF = -1.0e9
 
 
+
 @dataclass
 class GNNAgentOutput:
-    source_logits: torch.Tensor
-    angle_mu: torch.Tensor
-    angle_kappa: torch.Tensor
+    target_logits: torch.Tensor
     ship_logits: torch.Tensor
     value: torch.Tensor
-    selected_source: torch.Tensor
-    source_mask: torch.Tensor
-    hx: torch.Tensor  # Hidden state của LSTM
-    cx: torch.Tensor  # Cell state của LSTM
+    valid_source_mask: torch.Tensor
+    hx: torch.Tensor | None = None
+    cx: torch.Tensor | None = None
 
 def _require_pyg() -> None:
     if GINEConv is None or global_mean_pool is None or to_dense_batch is None:
@@ -97,8 +98,6 @@ class GNNBackbone(nn.Module):
         self.edge_encoder = make_mlp(edge_dim, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
         self.global_encoder = make_mlp(global_dim, hidden_dim, hidden_dim, num_layers=2, dropout=dropout)
 
-        self.dummy_embedding = nn.Parameter(torch.randn(self.hidden_dim))
-
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         for _ in range(num_layers):
@@ -123,9 +122,6 @@ class GNNBackbone(nn.Module):
         node_h = self.node_encoder(x)
         edge_h = self.edge_encoder(edge_attr)
         global_h = self.global_encoder(global_attr)
-
-        dummy_mask = (planet_ids == -1)
-        node_h[dummy_mask] = self.dummy_embedding
 
         node_h = node_h + global_h[batch]
         for conv, norm in zip(self.convs, self.norms):
@@ -159,7 +155,7 @@ class GNNAgent(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 3,
         num_ship_buckets: int = 20,
-        dropout: float = 0.2,
+        dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -171,20 +167,20 @@ class GNNAgent(nn.Module):
             global_dim=global_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            dropout=dropout,
+            dropout=0.0,
         )
         # self.lstm = nn.LSTMCell(hidden_dim, hidden_dim)
+        self.no_action_idx = MAX_PLANETS
+        self.max_planets = MAX_PLANETS
 
-        self.source_head = make_mlp(hidden_dim * 2, hidden_dim, 1, num_layers=3, dropout=dropout)
-        self.angle_head = make_mlp(hidden_dim * 2, hidden_dim, 2, num_layers=3, dropout=dropout)
-        self.ship_head = make_mlp(hidden_dim * 2, hidden_dim, num_ship_buckets, num_layers=3, dropout=dropout)
+        self.target_head = make_mlp(hidden_dim * 2, hidden_dim, self.max_planets + 1, num_layers=2, dropout=dropout)
+        self.ship_head = make_mlp(hidden_dim * 2, hidden_dim, num_ship_buckets, num_layers=2, dropout=dropout)
         self.critic_head = make_mlp(hidden_dim, hidden_dim, 1, num_layers=2, dropout=dropout)
 
     def forward(
         self,
         data: Any,
         *,
-        source_index: torch.Tensor | None = None,
         deterministic: bool = False,
         hx: torch.Tensor | None = None,
         cx: torch.Tensor | None = None,
@@ -209,43 +205,37 @@ class GNNAgent(nn.Module):
         # hx, cx = self.lstm(graph_h, (hx, cx))
         # graph_context = hx  # Dùng bộ nhớ làm bối cảnh toàn cục
         graph_context = graph_h
-
-        batch_size = graph_context.size(0)
-        dense_node_h, node_mask = to_dense_batch(node_h, batch)
         graph_per_node = graph_context[batch]
+        node_ctx = torch.cat([node_h, graph_per_node], dim=-1)
 
-        source_logits_node = self.source_head(torch.cat([node_h, graph_per_node], dim=-1)).squeeze(-1)
-        source_logits, _ = to_dense_batch(source_logits_node, batch, fill_value=NEG_INF)
-        source_mask = _dense_bool_attr(data, "source_mask", batch, fallback=node_mask)
-        source_mask = source_mask & node_mask
-        source_mask = _force_teacher_indices(source_mask, source_index)
-        source_logits = source_logits.masked_fill(~source_mask, NEG_INF)
+        target_logits_node = self.target_head(node_ctx)
+        ship_logits_node = self.ship_head(node_ctx)
 
-        selected_source = _teacher_or_policy_index(
-            source_logits,
-            source_index,
-            deterministic=deterministic,
-        )
-        batch_idx = torch.arange(batch_size, device=x.device)
-        source_h = dense_node_h[batch_idx, selected_source]
+        target_logits, node_mask = to_dense_batch(target_logits_node, batch, fill_value=-1e9, max_num_nodes=MAX_PLANETS)
+        ship_logits, _ = to_dense_batch(ship_logits_node, batch, fill_value=0.0, max_num_nodes=MAX_PLANETS)
 
-        # Angle Prediction
-        angle_out = self.angle_head(torch.cat([source_h, graph_context], dim=-1))
-        mu = angle_out[:, 0]  # Radian (không giới hạn, VonMises tự wrap)
-        kappa = F.softplus(angle_out[:, 1]) + 1e-3  # Đảm bảo kappa luôn dương
+        valid_source_mask = _dense_bool_attr(data, "source_mask", batch, fallback=node_mask)
+        valid_source_mask = valid_source_mask & node_mask
 
-        ship_logits = self.ship_head(torch.cat([source_h, graph_context], dim=-1))
-        
+        # INVALID TARGET MASK(Padding node)
+        invalid_target_mask = ~node_mask.unsqueeze(1).expand(-1, self.max_planets, -1) # [B, MAX_PLANETS, MAX_PLANETS]
+        target_logits[..., :self.max_planets] = target_logits[..., :self.max_planets].masked_fill(invalid_target_mask, -1e9)
+
+        # SELF TARGET MASK
+        diag_mask = torch.eye(self.max_planets, device=target_logits.device).bool().unsqueeze(0)
+        target_logits[..., :self.max_planets] = target_logits[..., :self.max_planets].masked_fill(diag_mask, -1e9)
+
+        # INVALID SOURCE MASK
+        invalid_source_mask = ~valid_source_mask
+        target_logits[..., :self.max_planets] = target_logits[..., :self.max_planets].masked_fill(invalid_source_mask.unsqueeze(-1), -1e9)
+
         value = self.critic_head(graph_context).squeeze(-1)
 
         return GNNAgentOutput(
-            source_logits=source_logits,
-            angle_mu=mu,
-            angle_kappa=kappa,
+            target_logits=target_logits,
             ship_logits=ship_logits,
             value=value,
-            selected_source=selected_source,
-            source_mask=source_mask,
+            valid_source_mask=valid_source_mask,
             hx=hx, cx=cx,
         )
 
@@ -254,75 +244,131 @@ class GNNAgent(nn.Module):
         output = self.forward(data, deterministic=deterministic)
 
         if deterministic:
-            angle = output.angle_mu
+            target = torch.argmax(output.target_logits, dim=-1)
             ship_bucket = torch.argmax(output.ship_logits, dim=-1)
         else:
-            dist = VonMises(output.angle_mu, output.angle_kappa)
-            angle = dist.sample()
+            target_dist = torch.distributions.Categorical(logits=output.target_logits)
+            target = target_dist.sample()
+
             ship_dist = torch.distributions.Categorical(logits=output.ship_logits)
             ship_bucket = ship_dist.sample()
 
         ship_pct = ship_bucket.float() / (self.num_ship_buckets - 1)
+        active_sources = (target != self.no_action_idx) & output.valid_source_mask
 
         return {
-            "source": output.selected_source,
-            "angle": angle,
-            "ship_pct": ship_pct,
+            "active_sources": active_sources, # Mask [B, MAX_PLANETS] cho biết node nào xuất quân
+            "target": target,                 # Index target [B, MAX_PLANETS]
+            "ship_pct": ship_pct,             # Tỷ lệ tàu [B, MAX_PLANETS]
             "value": output.value,
             "hx": output.hx,
             "cx": output.cx,
         }
 
-
 def pointer_imitation_loss(
-    output: GNNAgentOutput,
+    output: Any, # GNNAgentOutput
     data: Any,
     *,
     num_ship_buckets: int = 20,
-    source_weight: float = 1.0,
-    angle_weight: float = 1.0,
+    target_weight: float = 1.0,
     ship_weight: float = 1.0,
-    ignore_index: int = IGNORE_INDEX,
+    no_action_weight: float = 0.01
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    y_source = data.y_source.view(-1).long()
-    y_angle = data.y_angle.float() # [sin, cos]
-    target_angle = torch.atan2(y_angle[:, 0], y_angle[:, 1])
-    y_ship_pct = data.y_ship_pct.view(-1).float()
+    
+    max_nodes = output.target_logits.size(1)
+    
+    no_action_idx = output.target_logits.size(-1) - 1 
 
-    source_loss = _cross_entropy_or_zero(output.source_logits, y_source, ignore_index)
+    batch = data.batch if hasattr(data, 'batch') and data.batch is not None else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
 
-    valid = (y_source != ignore_index)
-    if valid.any():
-        dist = VonMises(output.angle_mu[valid], output.angle_kappa[valid])
-        angle_loss = -dist.log_prob(target_angle[valid]).mean()
+    y_target_dense, _ = to_dense_batch(data.y_target, batch, fill_value=no_action_idx, max_num_nodes=max_nodes)
+    y_ship_pct_dense, _ = to_dense_batch(data.y_ship_pct, batch, fill_value=0.0, max_num_nodes=max_nodes)
 
-        target_bucket = (y_ship_pct[valid] * (num_ship_buckets - 1)).round().long()
-        ship_loss = F.cross_entropy(output.ship_logits[valid], target_bucket)
+    valid_mask = output.valid_source_mask
+    supervised_mask = valid_mask & (y_target_dense != IGNORE_INDEX)
+
+    if not supervised_mask.any():
+        zero = output.target_logits.sum() * 0.0 + output.ship_logits.sum() * 0.0
+        parts = {
+            "loss": zero.detach(),
+            "target_loss": zero.detach(),
+            "ship_loss": zero.detach(),
+            "target_acc": zero.detach(),
+            "active_target_acc": zero.detach(),
+            "source_acc": zero.detach(),
+            "source_iou": zero.detach(),
+            "ship_error": zero.detach(),
+        }
+        return zero, parts
+
+    pred_target_logits = output.target_logits[supervised_mask] # [N_valid, max_planets + 1]
+    pred_ship_logits = output.ship_logits[supervised_mask]     # [N_valid, num_ship_buckets]
+
+    y_target = y_target_dense[supervised_mask].long()
+    y_ship_pct = y_ship_pct_dense[supervised_mask].float()
+
+    num_classes = pred_target_logits.size(-1)
+    ce_weights = torch.ones(num_classes, device=pred_target_logits.device)
+    ce_weights[no_action_idx] = no_action_weight
+    target_loss = F.cross_entropy(pred_target_logits, y_target, weight=ce_weights)
+
+    is_acting = (y_target != no_action_idx)
+
+    if is_acting.any():
+        act_ship_logits = pred_ship_logits[is_acting]
+        act_y_ship_pct = y_ship_pct[is_acting]
+
+        target_bucket = (act_y_ship_pct * (num_ship_buckets - 1)).round().long()
+        
+        if random.random() < 0.01: 
+            print(f"\n[DEBUG] act_y_ship_pct: {act_y_ship_pct.unique()}")
+            print(f"[DEBUG] target_bucket: {target_bucket.unique()}")
+            
+        ship_loss = F.cross_entropy(act_ship_logits, target_bucket)
     else:
-        angle_loss = output.angle_mu.sum() * 0.0 + output.angle_kappa.sum() * 0.0
-        ship_loss = output.ship_logits.sum() * 0.0
+        ship_loss = pred_ship_logits.sum() * 0.0
 
-    total = source_weight * source_loss + angle_weight * angle_loss + ship_weight * ship_loss
+    total = target_weight * target_loss + ship_weight * ship_loss
 
     with torch.no_grad():
-        pred_angle = output.angle_mu
-        angle_error = (pred_angle - target_angle + torch.pi) % (2 * torch.pi) - torch.pi
-        angle_error = angle_error.abs().mean()
+        pred_target_class = torch.argmax(pred_target_logits, dim=-1)
         
-        pred_ship_pct = torch.argmax(output.ship_logits, dim=-1).float() / (num_ship_buckets - 1)
-        ship_error = (pred_ship_pct[valid] - y_ship_pct[valid]).abs().mean() if valid.any() else torch.tensor(0.0)
+        target_acc = (pred_target_class == y_target).float().mean()
+        
+        pred_acting = pred_target_class != no_action_idx
+        correct_sources = (pred_acting == is_acting).float()
+        source_acc = correct_sources.mean()
+
+        pred_acting_dense = (torch.argmax(output.target_logits, dim=-1) != no_action_idx) & supervised_mask
+        is_acting_dense = (y_target_dense != no_action_idx) & supervised_mask
+
+        intersection = (pred_acting_dense & is_acting_dense).sum(dim=-1).float()
+        union = (pred_acting_dense | is_acting_dense).sum(dim=-1).float()
+        iou = (intersection / (union + 1e-8)).mean()
+
+        if is_acting.any():
+            act_pred_target = pred_target_class[is_acting]
+            act_y_target = y_target[is_acting]
+            active_target_acc = (act_pred_target == act_y_target).float().mean()
+            
+            # Sai số trung bình của số lượng tàu xuất đi
+            pred_ship_pct_val = torch.argmax(act_ship_logits, dim=-1).float() / (num_ship_buckets - 1)
+            ship_error = (pred_ship_pct_val - act_y_ship_pct).abs().mean()
+        else:
+            active_target_acc = torch.tensor(0.0, device=pred_target_logits.device)
+            ship_error = torch.tensor(0.0, device=pred_target_logits.device)
 
     parts = {
         "loss": total.detach(),
-        "source_loss": source_loss.detach(),
-        "angle_loss": angle_loss.detach(),
+        "target_loss": target_loss.detach(),
         "ship_loss": ship_loss.detach(),
-        "source_acc": _accuracy(output.source_logits, y_source, ignore_index).detach(),
-        "angle_error": angle_error.detach(),
+        "target_acc": target_acc.detach(),
+        "active_target_acc": active_target_acc.detach(),
+        "source_acc": source_acc.detach(),
+        "source_iou": iou.detach(),
         "ship_error": ship_error.detach(),
     }
     return total, parts
-
 
 def _batch_vector(data: Any, x: torch.Tensor) -> torch.Tensor:
     batch = getattr(data, "batch", None)
@@ -346,56 +392,11 @@ def _dense_bool_attr(data: Any, name: str, batch: torch.Tensor, *, fallback: tor
     attr = getattr(data, name, None)
     if attr is None:
         return fallback
-    dense_attr, _ = to_dense_batch(attr.to(torch.bool), batch, fill_value=False)
+    dense_attr, _ = to_dense_batch(attr.to(torch.bool), batch, fill_value=False, max_num_nodes=MAX_PLANETS)
     return dense_attr
-
-
-def _teacher_or_policy_index(
-    logits: torch.Tensor,
-    teacher_index: torch.Tensor | None,
-    *,
-    deterministic: bool,
-) -> torch.Tensor:
-    fallback = _policy_index(logits, deterministic=deterministic)
-    if teacher_index is None:
-        return fallback
-
-    teacher_index = teacher_index.to(device=logits.device, dtype=torch.long).view(-1)
-    valid = (teacher_index >= 0) & (teacher_index < logits.size(1))
-    safe_teacher = teacher_index.clamp(min=0, max=max(logits.size(1) - 1, 0))
-    return torch.where(valid, safe_teacher, fallback)
-
-
-def _force_teacher_indices(mask: torch.Tensor, teacher_index: torch.Tensor | None) -> torch.Tensor:
-    if teacher_index is None:
-        return mask
-    teacher_index = teacher_index.to(device=mask.device, dtype=torch.long).view(-1)
-    valid = (teacher_index >= 0) & (teacher_index < mask.size(1))
-    if not valid.any():
-        return mask
-
-    mask = mask.clone()
-    batch_idx = torch.arange(mask.size(0), device=mask.device)
-    mask[batch_idx[valid], teacher_index[valid]] = True
-    return mask
 
 
 def _policy_index(logits: torch.Tensor, *, deterministic: bool) -> torch.Tensor:
     if deterministic:
         return logits.argmax(dim=-1)
     return torch.distributions.Categorical(logits=logits).sample()
-
-
-def _cross_entropy_or_zero(logits: torch.Tensor, target: torch.Tensor, ignore_index: int) -> torch.Tensor:
-    valid = target != ignore_index
-    if valid.any():
-        return F.cross_entropy(logits, target, ignore_index=ignore_index)
-    return logits.sum() * 0.0
-
-
-def _accuracy(logits: torch.Tensor, target: torch.Tensor, ignore_index: int) -> torch.Tensor:
-    valid = target != ignore_index
-    if not valid.any():
-        return logits.sum() * 0.0
-    pred = logits.argmax(dim=-1)
-    return (pred[valid] == target[valid]).float().mean()

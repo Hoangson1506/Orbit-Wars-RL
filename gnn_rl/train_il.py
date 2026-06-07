@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import math
 import random
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
-import glob
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 import pandas as pd
 import numpy as np
 import torch
+
+try:
+    import pyarrow.parquet as pq
+except ImportError:
+    pq = None
 
 try:
     from torch_geometric.loader import DataLoader
@@ -24,31 +29,31 @@ if __package__ in {None, ""}:
     import sys
 
     sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from gnn_rl.datasets import OrbitWarsReplayDataset
+    from gnn_rl.datasets import GraphFeatureConfig, OrbitWarsGraphBuilder, OrbitWarsReplayDataset
     from gnn_rl.models import GNNAgent, pointer_imitation_loss
 else:
-    from .datasets import OrbitWarsReplayDataset
+    from .datasets import GraphFeatureConfig, OrbitWarsGraphBuilder, OrbitWarsReplayDataset
     from .models import GNNAgent, pointer_imitation_loss
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the Orbit Wars GNN pointer policy by imitation learning.")
     parser.add_argument("replays", nargs="*", help="Replay JSON files or directories. Defaults to gnn_rl/replays.")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=640)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--top-k-edges", type=int, default=12)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--top-k-edges", type=int, default=15)
     parser.add_argument("--num_ship_buckets", type=int, default=20)
-    parser.add_argument("--hidden-dim", type=int, default=512)
-    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--val-split", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--source-weight", type=float, default=1.0)
-    parser.add_argument("--angle-weight", type=float, default=1.0)
+    parser.add_argument("--target-weight", type=float, default=1.0)
     parser.add_argument("--ship-weight", type=float, default=1.0)
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-grad-norm", type=float, default=2.0)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--save-path", default="artifacts/gnn_il.pt")
     parser.add_argument(
@@ -67,10 +72,28 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     replay_paths = expand_replay_paths(args.replays)
+    graph_builder = OrbitWarsGraphBuilder(
+        GraphFeatureConfig(top_k_edges=args.top_k_edges)
+    )
 
-    chunk_files = sorted(glob.glob("parquet_chunks_full/*.parquet"))
+    chunk_dir = Path("player_tonyk_chunks")
+    if not chunk_dir.exists():
+        chunk_dir = Path(__file__).resolve().parent / "player_tonyk_chunks"
+    chunk_files = sorted(chunk_dir.glob("*.parquet"))
     if not chunk_files:
         raise ValueError("Không tìm thấy file parquet nào!")
+    if pq is None:
+        raise ImportError("pyarrow is required to read parquet replay chunks for IL training.")
+    
+    print("Estimating total training steps across all chunks...")
+    total_train_samples = 0
+    for file in chunk_files:
+        num_rows = pq.ParquetFile(file).metadata.num_rows
+        total_train_samples += int(num_rows * (1 - args.val_split))
+    
+    steps_per_epoch = max(1, math.ceil(total_train_samples / args.batch_size))
+    total_training_steps = steps_per_epoch * args.epochs
+    print(f"Total estimated training steps: {total_training_steps} ({steps_per_epoch} steps/epoch)")
     
     print("Reading peek samples")
     peek_df = pd.read_parquet(chunk_files[0]).head(10) # Đọc 10 dòng cho lẹ
@@ -78,6 +101,7 @@ def main() -> None:
     peek_dataset = OrbitWarsReplayDataset(
         replay_paths=replay_paths,
         dataframe=peek_df,
+        graph_builder=graph_builder,
         cache_path=None, # Không cache file nháp này
         action_observation_offset=args.action_observation_offset,
         skip_invalid=not args.keep_invalid,
@@ -97,6 +121,11 @@ def main() -> None:
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, 
+        T_max=total_training_steps, 
+        eta_min=args.lr * 0.01 
+    )
     best_val_loss = float("inf")
 
     print("=========Start Training==========")
@@ -116,6 +145,7 @@ def main() -> None:
             dataset = OrbitWarsReplayDataset(
                 replay_paths=replay_paths,
                 dataframe=df,
+                graph_builder=graph_builder,
                 cache_path=cache_path,
                 action_observation_offset=args.action_observation_offset,
                 skip_invalid=not args.keep_invalid,
@@ -137,8 +167,8 @@ def main() -> None:
                 )
 
             train_stats = run_epoch(
-                model, train_loader, device, optimizer=optimizer,
-                source_weight=args.source_weight, angle_weight=args.angle_weight,
+                model, train_loader, device, optimizer=optimizer, scheduler=scheduler,
+                target_weight=args.target_weight,
                 ship_weight=args.ship_weight, max_grad_norm=args.max_grad_norm,
                 num_ship_buckets=args.num_ship_buckets
             )
@@ -151,7 +181,7 @@ def main() -> None:
             if val_loader is not None:
                 val_stats = run_epoch(
                     model, val_loader, device, optimizer=None,
-                    source_weight=args.source_weight, angle_weight=args.angle_weight,
+                    target_weight=args.target_weight,
                     ship_weight=args.ship_weight, max_grad_norm=args.max_grad_norm,
                     num_ship_buckets=args.num_ship_buckets
                 )
@@ -182,8 +212,8 @@ def run_epoch(
     device: torch.device,
     *,
     optimizer: torch.optim.Optimizer | None,
-    source_weight: float,
-    angle_weight: float,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
+    target_weight: float,
     ship_weight: float,
     max_grad_norm: float,
     num_ship_buckets: int = 20,
@@ -201,15 +231,13 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             output = model(
                 batch,
-                source_index=batch.y_source.view(-1),
                 deterministic=True,
             )
             loss, parts = pointer_imitation_loss(
                 output,
                 batch,
                 num_ship_buckets=num_ship_buckets,
-                source_weight=source_weight,
-                angle_weight=angle_weight,
+                target_weight=target_weight,
                 ship_weight=ship_weight,
             )
 
@@ -218,13 +246,18 @@ def run_epoch(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+
+        current_lr = optimizer.param_groups[0]['lr'] if optimizer else 0.0
 
         pbar.set_postfix(loss=float(loss.item()), 
-                         source_loss=float(parts["source_loss"].item()), 
-                         angle_loss=float(parts["angle_loss"].item()), 
+                         target_loss=float(parts["target_loss"].item()), 
                          ship_loss=parts["ship_loss"].item(), 
-                         angle_error=parts["angle_error"].item(), 
-                         ship_error=parts["ship_error"].item()
+                         target_acc=parts["target_acc"].item(), 
+                         source_acc=parts["source_acc"].item(), 
+                         ship_error=parts["ship_error"].item(),
+                         lr=f"{current_lr:.2e}"
                          )
 
         for key, value in parts.items():
@@ -297,7 +330,7 @@ def save_checkpoint(
 
 
 def _format_stats(prefix: str, stats: dict[str, float]) -> str:
-    keys = ["loss", "source_loss", "angle_loss", "ship_loss", "source_acc", "angle_error"]
+    keys = ["loss", "target_loss", "ship_loss", "source_acc", "source_iou", "target_acc", "active_target_acc", "ship_error"]
     return " ".join(f"{prefix}_{key}={stats.get(key, 0.0):.4f}" for key in keys)
 
 
